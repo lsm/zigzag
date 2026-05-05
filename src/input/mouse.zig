@@ -37,15 +37,7 @@ pub const MouseEvent = struct {
     event_type: EventType,
     modifiers: keys.Modifiers = .{},
 
-    pub fn format(
-        self: MouseEvent,
-        comptime fmt: []const u8,
-        options: std.fmt.FormatOptions,
-        writer: *Writer,
-    ) !void {
-        _ = fmt;
-        _ = options;
-
+    pub fn format(self: MouseEvent, writer: *Writer) Writer.Error!void {
         try writer.print("{s} {s} at ({d}, {d})", .{
             @tagName(self.event_type),
             @tagName(self.button),
