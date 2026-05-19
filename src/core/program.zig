@@ -54,7 +54,8 @@ pub fn Program(comptime Model: type) type {
         terminal: ?Terminal,
         context: Context,
         options: Options,
-        running: bool,
+        running: std.atomic.Value(bool),
+        message_queue: MessageQueue,
         /// Boot-clock epoch from which `last_frame_time` and `context.elapsed` are measured.
         /// `.boot` includes time the system was suspended, giving a monotonic reading
         /// without gaps on resume.
@@ -78,6 +79,36 @@ pub fn Program(comptime Model: type) type {
         filter: ?*const fn (UserMsg) ?UserMsg,
 
         const Self = @This();
+
+        const MessageQueue = struct {
+            mutex: std.atomic.Mutex = .unlocked,
+            items: [512]UserMsg = undefined,
+            head: usize = 0,
+            len: usize = 0,
+
+            const capacity = 512;
+
+            fn push(self: *MessageQueue, m: UserMsg) !void {
+                while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+                defer self.mutex.unlock();
+
+                if (self.len == capacity) return error.MessageQueueFull;
+                const index = (self.head + self.len) % capacity;
+                self.items[index] = m;
+                self.len += 1;
+            }
+
+            fn pop(self: *MessageQueue) ?UserMsg {
+                while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+                defer self.mutex.unlock();
+
+                if (self.len == 0) return null;
+                const m = self.items[self.head];
+                self.head = (self.head + 1) % capacity;
+                self.len -= 1;
+                return m;
+            }
+        };
 
         /// Initialize the program.
         pub fn init(
@@ -106,7 +137,8 @@ pub fn Program(comptime Model: type) type {
                 .terminal = null,
                 .context = undefined,
                 .options = options,
-                .running = false,
+                .running = std.atomic.Value(bool).init(false),
+                .message_queue = .{},
                 .clock_epoch = clock_epoch,
                 .last_frame_time = 0,
                 .pacing_epoch = clock_epoch,
@@ -155,7 +187,7 @@ pub fn Program(comptime Model: type) type {
             try self.start();
 
             // Main event loop
-            while (self.running) {
+            while (self.running.load(.acquire)) {
                 try self.tick();
             }
         }
@@ -225,12 +257,12 @@ pub fn Program(comptime Model: type) type {
             const init_cmd = self.model.init(&self.context);
             try self.processCommand(init_cmd);
 
-            self.running = true;
+            self.running.store(true, .release);
         }
 
         /// Returns true if the program is still running.
         pub fn isRunning(self: *const Self) bool {
-            return self.running;
+            return self.running.load(.acquire);
         }
 
         /// Execute a single frame: poll input, process events, render.
@@ -244,6 +276,8 @@ pub fn Program(comptime Model: type) type {
             self.context.frame += 1;
 
             self.resetFrameAllocator();
+
+            try self.drainMessageQueue();
 
             // Check for resize
             if (self.terminal.?.checkResize()) {
@@ -340,6 +374,13 @@ pub fn Program(comptime Model: type) type {
             }
         }
 
+        pub fn drainMessageQueue(self: *Self) !void {
+            while (self.message_queue.pop()) |m| {
+                const cmd = self.dispatchToModel(m);
+                try self.processCommand(cmd);
+            }
+        }
+
         /// Dispatch a message to the model, applying the filter if set
         fn dispatchToModel(self: *Self, user_msg: UserMsg) UserCmd {
             if (self.filter) |f| {
@@ -357,7 +398,7 @@ pub fn Program(comptime Model: type) type {
                 switch (key.key) {
                     .char => |c| {
                         if (c == 'c') {
-                            self.running = false;
+                            self.running.store(false, .release);
                             return null;
                         }
                         // Handle Ctrl+Z for suspend
@@ -452,7 +493,7 @@ pub fn Program(comptime Model: type) type {
             switch (cmd) {
                 .none => {},
                 .quit => {
-                    self.running = false;
+                    self.running.store(false, .release);
                 },
                 .tick => |ns| {
                     self.pending_tick = self.context.elapsed + ns;
@@ -849,13 +890,12 @@ pub fn Program(comptime Model: type) type {
 
         /// Send a message to the model
         pub fn send(self: *Self, m: UserMsg) !void {
-            const cmd = self.dispatchToModel(m);
-            try self.processCommand(cmd);
+            try self.message_queue.push(m);
         }
 
         /// Stop the program
         pub fn quit(self: *Self) void {
-            self.running = false;
+            self.running.store(false, .release);
         }
     };
 }
