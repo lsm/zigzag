@@ -56,6 +56,7 @@ pub fn Program(comptime Model: type) type {
         options: Options,
         running: std.atomic.Value(bool),
         message_queue: MessageQueue,
+        main_thread_id: std.Thread.Id,
         /// Boot-clock epoch from which `last_frame_time` and `context.elapsed` are measured.
         /// `.boot` includes time the system was suspended, giving a monotonic reading
         /// without gaps on resume.
@@ -117,6 +118,15 @@ pub fn Program(comptime Model: type) type {
                     self.head = 0;
                 }
             }
+
+            fn requeueFront(self: *MessageQueue, messages: []const UserMsg) !void {
+                if (messages.len == 0) return;
+
+                while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+                defer self.mutex.unlock();
+
+                try self.items.insertSlice(self.head, messages);
+            }
         };
 
         /// Initialize the program.
@@ -148,6 +158,7 @@ pub fn Program(comptime Model: type) type {
                 .options = options,
                 .running = std.atomic.Value(bool).init(false),
                 .message_queue = MessageQueue.init(allocator),
+                .main_thread_id = std.Thread.getCurrentId(),
                 .clock_epoch = clock_epoch,
                 .last_frame_time = 0,
                 .pacing_epoch = clock_epoch,
@@ -391,9 +402,12 @@ pub fn Program(comptime Model: type) type {
             defer batch.deinit();
 
             try self.message_queue.popBatch(&batch);
-            for (batch.items) |m| {
+            for (batch.items, 0..) |m, i| {
                 const cmd = self.dispatchToModel(m);
-                try self.processCommand(cmd);
+                self.processCommand(cmd) catch |err| {
+                    try self.message_queue.requeueFront(batch.items[i + 1 ..]);
+                    return err;
+                };
             }
         }
 
@@ -904,8 +918,18 @@ pub fn Program(comptime Model: type) type {
             }
         }
 
-        /// Send a message to the model
+        /// Send a message to the model.
+        ///
+        /// Same-thread sends dispatch immediately, preserving the original
+        /// synchronous payload lifetime contract for stack/frame-backed data.
+        /// Background-thread sends enqueue for main-thread delivery.
         pub fn send(self: *Self, m: UserMsg) !void {
+            if (std.Thread.getCurrentId() == self.main_thread_id) {
+                const cmd = self.dispatchToModel(m);
+                try self.processCommand(cmd);
+                return;
+            }
+
             try self.message_queue.push(m);
         }
 

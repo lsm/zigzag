@@ -53,7 +53,7 @@ test "Program.init context allocator is stable before start and can be rebound t
     try testing.expectEqual(arena_ptr, rebound_context_allocator_ptr);
 }
 
-test "Program.send queues messages until main thread drains them" {
+test "Program.send dispatches same-thread messages immediately" {
     var env_map: std.process.Environ.Map = .init(testing.allocator);
     defer env_map.deinit();
 
@@ -67,7 +67,7 @@ test "Program.send queues messages until main thread drains them" {
     program.model = .{};
     program.context.allocator = program.arena.allocator();
     try program.send(.{ .nop = {} });
-    try testing.expectEqual(@as(usize, 0), program.model.update_count);
+    try testing.expectEqual(@as(usize, 1), program.model.update_count);
 
     try program.drainMessageQueue();
     try testing.expectEqual(@as(usize, 1), program.model.update_count);
@@ -109,7 +109,7 @@ test "Program.send accepts messages from background threads" {
     try testing.expectEqual(@as(usize, 256), program.model.update_count);
 }
 
-test "Program.tick drains queued messages before resetting frame allocator" {
+test "Program.send dispatches same-thread frame-backed payloads immediately" {
     var env_map: std.process.Environ.Map = .init(testing.allocator);
     defer env_map.deinit();
 
@@ -122,14 +122,9 @@ test "Program.tick drains queued messages before resetting frame allocator" {
 
     program.model = .{};
     program.context.allocator = program.arena.allocator();
-    program.context.frame = 0;
-    program.last_frame_time = 0;
-    program.last_view_hash = std.hash.Wyhash.hash(0, "");
-    program.terminal = null;
 
     const text = try std.fmt.allocPrint(program.context.allocator, "frame-text-{d}", .{42});
     try program.send(.{ .text = text });
-
-    try program.drainMessageQueue();
     try testing.expectEqualSlices(u8, "frame-text-42", program.model.last_text);
 }
+
