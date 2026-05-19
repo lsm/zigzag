@@ -58,6 +58,7 @@ test "Program.send queues messages until main thread drains them" {
     );
     defer program.deinit();
 
+    program.model = .{};
     program.context.allocator = program.arena.allocator();
     try program.send(.{ .nop = {} });
     try testing.expectEqual(@as(usize, 0), program.model.update_count);
@@ -88,6 +89,7 @@ test "Program.send accepts messages from background threads" {
     );
     defer program.deinit();
 
+    program.model = .{};
     program.context.allocator = program.arena.allocator();
 
     var threads: [4]std.Thread = undefined;

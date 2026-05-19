@@ -82,31 +82,40 @@ pub fn Program(comptime Model: type) type {
 
         const MessageQueue = struct {
             mutex: std.atomic.Mutex = .unlocked,
-            items: [512]UserMsg = undefined,
+            items: std.array_list.Managed(UserMsg),
             head: usize = 0,
-            len: usize = 0,
 
-            const capacity = 512;
+            const max_drain_per_frame = 512;
+
+            fn init(allocator: std.mem.Allocator) MessageQueue {
+                return .{ .items = std.array_list.Managed(UserMsg).init(allocator) };
+            }
+
+            fn deinit(self: *MessageQueue) void {
+                self.items.deinit();
+                self.* = undefined;
+            }
 
             fn push(self: *MessageQueue, m: UserMsg) !void {
                 while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
                 defer self.mutex.unlock();
 
-                if (self.len == capacity) return error.MessageQueueFull;
-                const index = (self.head + self.len) % capacity;
-                self.items[index] = m;
-                self.len += 1;
+                try self.items.append(m);
             }
 
-            fn pop(self: *MessageQueue) ?UserMsg {
+            fn popBatch(self: *MessageQueue, batch: *std.array_list.Managed(UserMsg)) !void {
                 while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
                 defer self.mutex.unlock();
 
-                if (self.len == 0) return null;
-                const m = self.items[self.head];
-                self.head = (self.head + 1) % capacity;
-                self.len -= 1;
-                return m;
+                const available = self.items.items.len - self.head;
+                const count = @min(available, max_drain_per_frame);
+                try batch.appendSlice(self.items.items[self.head .. self.head + count]);
+                self.head += count;
+
+                if (self.head > 0 and (self.head == self.items.items.len or self.head >= max_drain_per_frame)) {
+                    self.items.replaceRangeAssumeCapacity(0, self.head, &.{});
+                    self.head = 0;
+                }
             }
         };
 
@@ -138,7 +147,7 @@ pub fn Program(comptime Model: type) type {
                 .context = undefined,
                 .options = options,
                 .running = std.atomic.Value(bool).init(false),
-                .message_queue = .{},
+                .message_queue = MessageQueue.init(allocator),
                 .clock_epoch = clock_epoch,
                 .last_frame_time = 0,
                 .pacing_epoch = clock_epoch,
@@ -168,6 +177,7 @@ pub fn Program(comptime Model: type) type {
             if (self.logger) |*l| {
                 l.deinit();
             }
+            self.message_queue.deinit();
             self.arena.deinit();
 
             // Call model's deinit if it exists
@@ -375,7 +385,11 @@ pub fn Program(comptime Model: type) type {
         }
 
         pub fn drainMessageQueue(self: *Self) !void {
-            while (self.message_queue.pop()) |m| {
+            var batch = std.array_list.Managed(UserMsg).init(self.allocator);
+            defer batch.deinit();
+
+            try self.message_queue.popBatch(&batch);
+            for (batch.items) |m| {
                 const cmd = self.dispatchToModel(m);
                 try self.processCommand(cmd);
             }
