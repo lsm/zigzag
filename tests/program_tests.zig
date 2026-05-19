@@ -4,9 +4,11 @@ const zz = @import("zigzag");
 
 const DummyModel = struct {
     update_count: usize = 0,
+    last_text: []const u8 = "",
 
     pub const Msg = union(enum) {
         nop: void,
+        text: []const u8,
         quit: void,
     };
 
@@ -18,6 +20,10 @@ const DummyModel = struct {
         self.update_count += 1;
         return switch (msg) {
             .nop => .none,
+            .text => |text| blk: {
+                self.last_text = text;
+                break :blk .none;
+            },
             .quit => .quit,
         };
     }
@@ -101,4 +107,29 @@ test "Program.send accepts messages from background threads" {
     try testing.expectEqual(@as(usize, 0), program.model.update_count);
     try program.drainMessageQueue();
     try testing.expectEqual(@as(usize, 256), program.model.update_count);
+}
+
+test "Program.tick drains queued messages before resetting frame allocator" {
+    var env_map: std.process.Environ.Map = .init(testing.allocator);
+    defer env_map.deinit();
+
+    var program = zz.Program(DummyModel).init(
+        testing.allocator,
+        testing.io,
+        &env_map,
+    );
+    defer program.deinit();
+
+    program.model = .{};
+    program.context.allocator = program.arena.allocator();
+    program.context.frame = 0;
+    program.last_frame_time = 0;
+    program.last_view_hash = std.hash.Wyhash.hash(0, "");
+    program.terminal = null;
+
+    const text = try std.fmt.allocPrint(program.context.allocator, "frame-text-{d}", .{42});
+    try program.send(.{ .text = text });
+
+    try program.drainMessageQueue();
+    try testing.expectEqualSlices(u8, "frame-text-42", program.model.last_text);
 }

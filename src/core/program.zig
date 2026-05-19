@@ -285,9 +285,11 @@ pub fn Program(comptime Model: type) type {
             self.context.elapsed = tick_start;
             self.context.frame += 1;
 
-            self.resetFrameAllocator();
-
+            // Drain queued messages before resetting the frame arena. This preserves
+            // payloads created from the previous frame allocator until delivery.
             try self.drainMessageQueue();
+
+            self.resetFrameAllocator();
 
             // Check for resize
             if (self.terminal.?.checkResize()) {
