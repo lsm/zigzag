@@ -8,6 +8,7 @@ pub fn AsyncRunner(comptime Msg: type) type {
     return struct {
         allocator: std.mem.Allocator,
         results: ResultQueue,
+        results_mutex: std.atomic.Mutex = .unlocked,
         next_id: u32 = 1,
 
         const Self = @This();
@@ -77,6 +78,9 @@ pub fn AsyncRunner(comptime Msg: type) type {
         /// Poll for completed results. Returns messages from finished tasks.
         /// Call this each frame to collect async results.
         pub fn poll(self: *Self) []Msg {
+            while (!self.results_mutex.tryLock()) std.atomic.spinLoopHint();
+            defer self.results_mutex.unlock();
+
             if (self.results.items.len == 0) return &.{};
 
             var msgs = std.array_list.Managed(Msg).init(self.allocator);
@@ -90,6 +94,9 @@ pub fn AsyncRunner(comptime Msg: type) type {
         }
 
         fn pushResult(self: *Self, m: Msg) void {
+            while (!self.results_mutex.tryLock()) std.atomic.spinLoopHint();
+            defer self.results_mutex.unlock();
+
             self.results.append(m) catch {};
         }
 

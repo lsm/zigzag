@@ -54,7 +54,9 @@ pub fn Program(comptime Model: type) type {
         terminal: ?Terminal,
         context: Context,
         options: Options,
-        running: bool,
+        running: std.atomic.Value(bool),
+        message_queue: MessageQueue,
+        main_thread_id: std.Thread.Id,
         /// Boot-clock epoch from which `last_frame_time` and `context.elapsed` are measured.
         /// `.boot` includes time the system was suspended, giving a monotonic reading
         /// without gaps on resume.
@@ -78,6 +80,54 @@ pub fn Program(comptime Model: type) type {
         filter: ?*const fn (UserMsg) ?UserMsg,
 
         const Self = @This();
+
+        const MessageQueue = struct {
+            mutex: std.atomic.Mutex = .unlocked,
+            items: std.array_list.Managed(UserMsg),
+            head: usize = 0,
+
+            const max_drain_per_frame = 512;
+
+            fn init(allocator: std.mem.Allocator) MessageQueue {
+                return .{ .items = std.array_list.Managed(UserMsg).init(allocator) };
+            }
+
+            fn deinit(self: *MessageQueue) void {
+                self.items.deinit();
+                self.* = undefined;
+            }
+
+            fn push(self: *MessageQueue, m: UserMsg) !void {
+                while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+                defer self.mutex.unlock();
+
+                try self.items.append(m);
+            }
+
+            fn popBatch(self: *MessageQueue, batch: *std.array_list.Managed(UserMsg)) !void {
+                while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+                defer self.mutex.unlock();
+
+                const available = self.items.items.len - self.head;
+                const count = @min(available, max_drain_per_frame);
+                try batch.appendSlice(self.items.items[self.head .. self.head + count]);
+                self.head += count;
+
+                if (self.head > 0 and (self.head == self.items.items.len or self.head >= max_drain_per_frame)) {
+                    self.items.replaceRangeAssumeCapacity(0, self.head, &.{});
+                    self.head = 0;
+                }
+            }
+
+            fn requeueFront(self: *MessageQueue, messages: []const UserMsg) !void {
+                if (messages.len == 0) return;
+
+                while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+                defer self.mutex.unlock();
+
+                try self.items.insertSlice(self.head, messages);
+            }
+        };
 
         /// Initialize the program.
         pub fn init(
@@ -106,7 +156,9 @@ pub fn Program(comptime Model: type) type {
                 .terminal = null,
                 .context = undefined,
                 .options = options,
-                .running = false,
+                .running = std.atomic.Value(bool).init(false),
+                .message_queue = MessageQueue.init(allocator),
+                .main_thread_id = std.Thread.getCurrentId(),
                 .clock_epoch = clock_epoch,
                 .last_frame_time = 0,
                 .pacing_epoch = clock_epoch,
@@ -136,6 +188,7 @@ pub fn Program(comptime Model: type) type {
             if (self.logger) |*l| {
                 l.deinit();
             }
+            self.message_queue.deinit();
             self.arena.deinit();
 
             // Call model's deinit if it exists
@@ -155,7 +208,7 @@ pub fn Program(comptime Model: type) type {
             try self.start();
 
             // Main event loop
-            while (self.running) {
+            while (self.running.load(.acquire)) {
                 try self.tick();
             }
         }
@@ -225,12 +278,12 @@ pub fn Program(comptime Model: type) type {
             const init_cmd = self.model.init(&self.context);
             try self.processCommand(init_cmd);
 
-            self.running = true;
+            self.running.store(true, .release);
         }
 
         /// Returns true if the program is still running.
         pub fn isRunning(self: *const Self) bool {
-            return self.running;
+            return self.running.load(.acquire);
         }
 
         /// Execute a single frame: poll input, process events, render.
@@ -242,6 +295,10 @@ pub fn Program(comptime Model: type) type {
             self.context.delta = actual_delta;
             self.context.elapsed = tick_start;
             self.context.frame += 1;
+
+            // Drain queued messages before resetting the frame arena. This preserves
+            // payloads created from the previous frame allocator until delivery.
+            try self.drainMessageQueue();
 
             self.resetFrameAllocator();
 
@@ -340,6 +397,20 @@ pub fn Program(comptime Model: type) type {
             }
         }
 
+        pub fn drainMessageQueue(self: *Self) !void {
+            var batch = std.array_list.Managed(UserMsg).init(self.allocator);
+            defer batch.deinit();
+
+            try self.message_queue.popBatch(&batch);
+            for (batch.items, 0..) |m, i| {
+                const cmd = self.dispatchToModel(m);
+                self.processCommand(cmd) catch |err| {
+                    try self.message_queue.requeueFront(batch.items[i + 1 ..]);
+                    return err;
+                };
+            }
+        }
+
         /// Dispatch a message to the model, applying the filter if set
         fn dispatchToModel(self: *Self, user_msg: UserMsg) UserCmd {
             if (self.filter) |f| {
@@ -357,7 +428,7 @@ pub fn Program(comptime Model: type) type {
                 switch (key.key) {
                     .char => |c| {
                         if (c == 'c') {
-                            self.running = false;
+                            self.running.store(false, .release);
                             return null;
                         }
                         // Handle Ctrl+Z for suspend
@@ -452,7 +523,7 @@ pub fn Program(comptime Model: type) type {
             switch (cmd) {
                 .none => {},
                 .quit => {
-                    self.running = false;
+                    self.running.store(false, .release);
                 },
                 .tick => |ns| {
                     self.pending_tick = self.context.elapsed + ns;
@@ -847,15 +918,24 @@ pub fn Program(comptime Model: type) type {
             }
         }
 
-        /// Send a message to the model
+        /// Send a message to the model.
+        ///
+        /// Same-thread sends dispatch immediately, preserving the original
+        /// synchronous payload lifetime contract for stack/frame-backed data.
+        /// Background-thread sends enqueue for main-thread delivery.
         pub fn send(self: *Self, m: UserMsg) !void {
-            const cmd = self.dispatchToModel(m);
-            try self.processCommand(cmd);
+            if (std.Thread.getCurrentId() == self.main_thread_id) {
+                const cmd = self.dispatchToModel(m);
+                try self.processCommand(cmd);
+                return;
+            }
+
+            try self.message_queue.push(m);
         }
 
         /// Stop the program
         pub fn quit(self: *Self) void {
-            self.running = false;
+            self.running.store(false, .release);
         }
     };
 }
