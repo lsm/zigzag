@@ -17,6 +17,7 @@ else if (builtin.os.tag == .windows)
     @import("platform/windows.zig")
 else
     @import("platform/posix.zig");
+const mouse = @import("../input/mouse.zig");
 
 pub const Size = platform.Size;
 pub const TerminalError = platform.TerminalError;
@@ -331,9 +332,10 @@ pub const Terminal = struct {
             try self.writeBytes(ansi.cursor_hide);
         }
 
-        // Enable mouse
+        // Enable normal mouse tracking (button/wheel only) with SGR encoding.
+        // This reports scroll wheel events while leaving drag selection to the terminal.
         if (self.config.mouse) {
-            try self.writeBytes("\x1b[?1003h\x1b[?1006h");
+            try self.writeBytes(mouse.enableSequence(.normal));
             self.state.mouse_enabled = true;
         }
 
@@ -375,7 +377,7 @@ pub const Terminal = struct {
 
         // Disable mouse
         if (self.state.mouse_enabled) {
-            self.writeBytes("\x1b[?1006l\x1b[?1003l") catch {};
+            self.writeBytes(mouse.disableSequence(.normal)) catch {};
             self.state.mouse_enabled = false;
         }
 
@@ -471,13 +473,13 @@ pub const Terminal = struct {
 
     /// Enable mouse tracking
     pub fn enableMouse(self: *Terminal) !void {
-        try self.writeBytes("\x1b[?1003h\x1b[?1006h");
+        try self.writeBytes(mouse.enableSequence(.normal));
         self.state.mouse_enabled = true;
     }
 
     /// Disable mouse tracking
     pub fn disableMouse(self: *Terminal) !void {
-        try self.writeBytes("\x1b[?1006l\x1b[?1003l");
+        try self.writeBytes(mouse.disableSequence(.normal));
         self.state.mouse_enabled = false;
     }
 

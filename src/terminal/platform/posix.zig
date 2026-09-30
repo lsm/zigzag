@@ -141,8 +141,9 @@ pub fn exitAltScreen(state: *State, writer: *Writer) !void {
 pub fn enableMouse(state: *State, writer: *Writer) !void {
     if (state.mouse_enabled) return;
 
-    // Enable SGR mouse mode with all motion tracking
-    try writer.writeAll("\x1b[?1003h\x1b[?1006h");
+    // Enable SGR normal mouse mode. This reports button/wheel events without
+    // stealing plain drag selection from the terminal.
+    try writer.writeAll("\x1b[?1000h\x1b[?1006h");
     state.mouse_enabled = true;
 }
 
@@ -150,7 +151,7 @@ pub fn enableMouse(state: *State, writer: *Writer) !void {
 pub fn disableMouse(state: *State, writer: *Writer) !void {
     if (!state.mouse_enabled) return;
 
-    try writer.writeAll("\x1b[?1006l\x1b[?1003l");
+    try writer.writeAll("\x1b[?1006l\x1b[?1000l");
     state.mouse_enabled = false;
 }
 
