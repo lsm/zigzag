@@ -91,10 +91,15 @@ pub fn build(b: *std.Build) void {
     // Tests
     const test_files = [_][]const u8{
         "tests/style_tests.zig",
+        "tests/color_tests.zig",
         "tests/input_tests.zig",
+        "tests/input_stream_tests.zig",
         "tests/layout_tests.zig",
         "tests/unicode_tests.zig",
         "tests/program_tests.zig",
+        "tests/command_tests.zig",
+        "tests/render_tests.zig",
+        "tests/harness_tests.zig",
         "tests/focus_tests.zig",
         "tests/modal_tests.zig",
         "tests/tooltip_tests.zig",
@@ -113,6 +118,8 @@ pub fn build(b: *std.Build) void {
         "tests/animation_tests.zig",
         "tests/accessibility_tests.zig",
         "tests/mouse_tests.zig",
+        "tests/hitbox_tests.zig",
+        "tests/component_tests.zig",
     };
 
     const test_step = b.step("test", "Run unit tests");

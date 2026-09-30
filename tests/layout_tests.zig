@@ -21,6 +21,34 @@ test "measure.width - ANSI sequences excluded" {
     try testing.expectEqual(@as(usize, 5), zz.width("\x1b[1;32mhello\x1b[0m"));
 }
 
+test "measure.width - string sequences carry no width" {
+    // OSC, terminated by BEL and by ST.
+    try testing.expectEqual(@as(usize, 5), zz.width("\x1b]8;;https://example.com\x07hello"));
+    try testing.expectEqual(@as(usize, 5), zz.width("\x1b]8;;https://example.com\x1b\\hello"));
+
+    // A whole hyperlink, opened and closed.
+    try testing.expectEqual(
+        @as(usize, 5),
+        zz.width("\x1b]8;;https://example.com\x07hello\x1b]8;;\x07"),
+    );
+
+    // DCS — how tmux passthrough and terminal replies are wrapped.
+    try testing.expectEqual(@as(usize, 5), zz.width("\x1bPtmux;\x1b\\hello"));
+
+    // APC — the Kitty graphics protocol. Its payload is base64, which used to
+    // be measured character by character and blow the line width apart.
+    try testing.expectEqual(@as(usize, 5), zz.width("\x1b_Gf=100,a=T;iVBORw0K\x1b\\hello"));
+
+    // PM and SOS.
+    try testing.expectEqual(@as(usize, 5), zz.width("\x1b^private\x1b\\hello"));
+    try testing.expectEqual(@as(usize, 5), zz.width("\x1bXstring\x1b\\hello"));
+}
+
+test "measure.maxLineWidth - string sequences carry no width" {
+    const framed = "\x1b_Gf=100,a=T;iVBORw0KGgoAAAANSUhEUg\x1b\\short\nlonger line";
+    try testing.expectEqual(@as(usize, 11), zz.measure.maxLineWidth(framed));
+}
+
 test "measure.height - simple" {
     try testing.expectEqual(@as(usize, 1), zz.height("hello"));
     try testing.expectEqual(@as(usize, 0), zz.height(""));
@@ -132,4 +160,91 @@ test "joinVertical convenience" {
     const result = try zz.joinVertical(allocator, &.{ "A", "B" });
     defer allocator.free(result);
     try testing.expectEqualStrings("A\nB", result);
+}
+
+test "layer.LayerStack - multibyte UTF-8 chars occupy one cell" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var stack = zz.layout.layer.LayerStack.init(allocator);
+    defer stack.deinit();
+    stack.setSize(5, 1);
+
+    try stack.push(.{ .content = "╭─╮", .transparent = false });
+
+    try testing.expectEqualStrings("╭─╮  ", try stack.render(allocator));
+}
+
+test "layer.LayerStack - styled multibyte border chars stay intact" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var stack = zz.layout.layer.LayerStack.init(allocator);
+    defer stack.deinit();
+    stack.setSize(4, 1);
+
+    try stack.push(.{ .content = "\x1b[36m─│\x1b[0m", .transparent = false });
+
+    try testing.expectEqualStrings(
+        "\x1b[36m─\x1b[0m\x1b[36m│\x1b[0m  ",
+        try stack.render(allocator),
+    );
+}
+
+test "layer.LayerStack - overlay aligns on UTF-8 background" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var stack = zz.layout.layer.LayerStack.init(allocator);
+    defer stack.deinit();
+    stack.setSize(6, 1);
+
+    try stack.push(.{ .content = "──────", .z = 0, .transparent = false });
+    try stack.push(.{ .content = "AB", .x = 2, .z = 1 });
+
+    try testing.expectEqualStrings("──AB──", try stack.render(allocator));
+}
+
+test "layer.LayerStack - wide characters cover two cells" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var stack = zz.layout.layer.LayerStack.init(allocator);
+    defer stack.deinit();
+    stack.setSize(4, 1);
+
+    try stack.push(.{ .content = "你a", .transparent = false });
+
+    try testing.expectEqualStrings("你a ", try stack.render(allocator));
+}
+
+test "layer.LayerStack - reports allocation failure instead of truncating" {
+    // The old signature had no way to say an allocation failed, so it returned
+    // a short frame — which reaches the screen looking like a rendering bug.
+    // Fail at each allocation in turn and check the result is always either a
+    // whole frame or an error, never something in between.
+    var fail_index: usize = 0;
+    while (fail_index < 8) : (fail_index += 1) {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+
+        var failing = std.testing.FailingAllocator.init(
+            arena.allocator(),
+            .{ .fail_index = fail_index },
+        );
+        const allocator = failing.allocator();
+
+        var stack = zz.layout.layer.LayerStack.init(allocator);
+        defer stack.deinit();
+        stack.setSize(40, 10);
+
+        stack.push(.{ .content = "hello", .transparent = false }) catch continue;
+
+        const out = stack.render(allocator) catch continue;
+        try testing.expectEqual(@as(usize, 10), zz.height(out));
+    }
 }

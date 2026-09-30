@@ -12,6 +12,7 @@ const command = @import("command.zig");
 const Logger = @import("log.zig").Logger;
 const unicode = @import("../unicode.zig");
 const Environment = @import("environment.zig").Environment;
+const model_contract = @import("model.zig");
 
 pub const Cmd = command.Cmd;
 pub const Msg = message;
@@ -23,23 +24,22 @@ const PendingImage = union(enum) {
     place_cached: command.PlaceCachedImage,
 };
 
+/// Bytes pulled from the terminal per read.
+const read_chunk_size = 1024;
+
+/// Upper bound on reads per tick, so a firehose on stdin cannot starve
+/// rendering.
+const max_reads_per_tick = 8;
+
 /// Program runtime that manages the application lifecycle
 pub fn Program(comptime Model: type) type {
-    // Ensure Model has required declarations
-    comptime {
-        if (!@hasDecl(Model, "Msg")) {
-            @compileError("Model must have a 'Msg' type declaration");
-        }
-        if (!@hasDecl(Model, "init")) {
-            @compileError("Model must have an 'init' function");
-        }
-        if (!@hasDecl(Model, "update")) {
-            @compileError("Model must have an 'update' function");
-        }
-        if (!@hasDecl(Model, "view")) {
-            @compileError("Model must have a 'view' function");
-        }
-    }
+    model_contract.validate(Model, "Model");
+
+    // `init`, `update` and `view` may each return an error union; the runtime
+    // propagates it instead of the model having to swallow it.
+    const init_fallible = model_contract.returnsError(@TypeOf(Model.init));
+    const update_fallible = model_contract.returnsError(@TypeOf(Model.update));
+    const view_fallible = model_contract.returnsError(@TypeOf(Model.view));
 
     const UserMsg = Model.Msg;
     const UserCmd = Cmd(UserMsg);
@@ -68,6 +68,10 @@ pub fn Program(comptime Model: type) type {
         pacing_epoch: std.Io.Clock.Timestamp,
         pacing_frame_offset: u64,
         pending_tick: ?u64,
+        /// `context.elapsed` captured when the active one-shot `pending_tick` was
+        /// scheduled, so the delivered `Tick.delta` reflects the time since the
+        /// tick was requested rather than the per-frame render delta.
+        pending_tick_scheduled_at: u64,
         every_interval: ?u64,
         last_every_tick: u64,
         last_view_hash: u64,
@@ -79,10 +83,8 @@ pub fn Program(comptime Model: type) type {
         relayout_above_split: ?usize,
         pending_image: ?PendingImage,
         logger: ?Logger,
-        paste_buffer: std.array_list.Managed(u8),
-        paste_pending_prefix: std.array_list.Managed(u8),
-        paste_pending_end_prefix: std.array_list.Managed(u8),
-        paste_active: bool,
+        /// Retains escape sequences that a read cut in half.
+        input_parser: keyboard.InputParser,
 
         /// Message filter function
         filter: ?*const fn (UserMsg) ?UserMsg,
@@ -172,6 +174,7 @@ pub fn Program(comptime Model: type) type {
                 .pacing_epoch = clock_epoch,
                 .pacing_frame_offset = 0,
                 .pending_tick = null,
+                .pending_tick_scheduled_at = 0,
                 .every_interval = null,
                 .last_every_tick = 0,
                 .last_view_hash = 0,
@@ -183,10 +186,7 @@ pub fn Program(comptime Model: type) type {
                 .relayout_above_split = null,
                 .pending_image = null,
                 .logger = null,
-                .paste_buffer = std.array_list.Managed(u8).init(allocator),
-                .paste_pending_prefix = std.array_list.Managed(u8).init(allocator),
-                .paste_pending_end_prefix = std.array_list.Managed(u8).init(allocator),
-                .paste_active = false,
+                .input_parser = .{},
                 .filter = null,
             };
 
@@ -209,9 +209,6 @@ pub fn Program(comptime Model: type) type {
             self.last_line_widths.deinit(self.allocator);
             self.last_frame.deinit(self.allocator);
             self.message_queue.deinit();
-            self.paste_buffer.deinit();
-            self.paste_pending_prefix.deinit();
-            self.paste_pending_end_prefix.deinit();
             self.arena.deinit();
 
             // Call model's deinit if it exists
@@ -273,6 +270,9 @@ pub fn Program(comptime Model: type) type {
                 .osc52 = self.options.osc52,
             });
 
+            self.input_parser.escape_timeout_ns =
+                @as(u64, self.options.escape_timeout_ms) * std.time.ns_per_ms;
+
             // Set title if provided
             if (self.options.title) |title| {
                 try self.terminal.?.setTitle(title);
@@ -302,7 +302,10 @@ pub fn Program(comptime Model: type) type {
             self.resetFrameAllocator();
 
             // Initialize the model
-            const init_cmd = self.model.init(&self.context);
+            const init_cmd = if (comptime init_fallible)
+                try self.model.init(&self.context)
+            else
+                self.model.init(&self.context);
             try self.processCommand(init_cmd);
 
             self.running.store(true, .release);
@@ -343,7 +346,7 @@ pub fn Program(comptime Model: type) type {
                     self.needs_repaint = true;
                     if (self.options.inline_bottom_viewport) self.relayout_above_split = self.context.above_buffer.items.len;
                     if (@hasField(UserMsg, "window_size")) {
-                        const cmd = self.dispatchToModel(.{ .window_size = .{
+                        const cmd = try self.dispatchToModel(.{ .window_size = .{
                             .width = self.context.width,
                             .height = self.context.height,
                         } });
@@ -354,23 +357,7 @@ pub fn Program(comptime Model: type) type {
             }
 
             // Non-blocking drain; input typed during pacing sits in the TTY buffer.
-            var input_buf: [256]u8 = undefined;
-            const bytes_read = try self.terminal.?.readInput(&input_buf, 0);
-
-            if (bytes_read > 0) {
-                const events = try self.parseInputEvents(input_buf[0..bytes_read]);
-                for (events) |event| {
-                    const user_cmd = switch (event) {
-                        .key => |k| self.processKeyEvent(k),
-                        .mouse => |m| self.processMouseEvent(m),
-                        .none => null,
-                    };
-                    if (user_cmd) |cmd| {
-                        try self.processCommand(cmd);
-                        if (!self.isRunning()) return;
-                    }
-                }
-            }
+            try self.drainInput();
 
             // Handle pending tick
             if (self.pending_tick) |tick_ns| {
@@ -378,11 +365,13 @@ pub fn Program(comptime Model: type) type {
                     self.pending_tick = null;
                     // Deliver tick to user's update if Model.Msg has a tick variant
                     if (@hasField(UserMsg, "tick")) {
+                        // Time since the tick was scheduled, not the frame delta.
+                        const tick_delta = self.context.elapsed -| self.pending_tick_scheduled_at;
                         const user_msg = UserMsg{ .tick = .{
                             .timestamp = @intCast(tick_start),
-                            .delta = actual_delta,
+                            .delta = tick_delta,
                         } };
-                        const cmd = self.dispatchToModel(user_msg);
+                        const cmd = try self.dispatchToModel(user_msg);
                         try self.processCommand(cmd);
                         if (!self.isRunning()) return;
                     }
@@ -392,13 +381,15 @@ pub fn Program(comptime Model: type) type {
             // Handle repeating tick
             if (self.every_interval) |interval| {
                 if (self.context.elapsed - self.last_every_tick >= interval) {
+                    // Time since the previous repeating tick, not the frame delta.
+                    const tick_delta = self.context.elapsed -| self.last_every_tick;
                     self.last_every_tick = self.context.elapsed;
                     if (@hasField(UserMsg, "tick")) {
                         const user_msg = UserMsg{ .tick = .{
                             .timestamp = @intCast(tick_start),
-                            .delta = actual_delta,
+                            .delta = tick_delta,
                         } };
-                        const cmd = self.dispatchToModel(user_msg);
+                        const cmd = try self.dispatchToModel(user_msg);
                         try self.processCommand(cmd);
                         if (!self.isRunning()) return;
                     }
@@ -430,7 +421,10 @@ pub fn Program(comptime Model: type) type {
                         .raw = .{ .nanoseconds = @intCast(deadline_offset_ns) },
                         .clock = .boot,
                     });
-                    deadline.wait(self.io) catch unreachable;
+                    // A wait that fails (a cancelled or interrupted sleep)
+                    // just means this frame is not paced; `unreachable` here
+                    // would be undefined behaviour in a release build.
+                    deadline.wait(self.io) catch {};
                 }
             }
         }
@@ -441,7 +435,7 @@ pub fn Program(comptime Model: type) type {
 
             try self.message_queue.popBatch(&batch);
             for (batch.items, 0..) |m, i| {
-                const cmd = self.dispatchToModel(m);
+                const cmd = try self.dispatchToModel(m);
                 self.processCommand(cmd) catch |err| {
                     try self.message_queue.requeueFront(batch.items[i + 1 ..]);
                     return err;
@@ -449,118 +443,56 @@ pub fn Program(comptime Model: type) type {
             }
         }
 
-        fn appendParsedInputEvents(
-            self: *Self,
-            results: *std.array_list.Managed(keyboard.ParseResult),
-            data: []const u8,
-        ) !void {
-            if (data.len == 0) return;
-            const parsed = try keyboard.parseAll(self.context.allocator, data);
-            try results.appendSlice(parsed);
-        }
+        /// Read whatever the terminal has ready and dispatch the events it
+        /// decodes into.
+        ///
+        /// Reads are non-blocking, so a burst that outgrows one buffer (paste,
+        /// or a trackpad producing mouse reports faster than a frame) is
+        /// picked up within the same tick instead of trickling in over the
+        /// following ones. `InputParser` stitches sequences back together when
+        /// a read lands in the middle of one.
+        fn drainInput(self: *Self) !void {
+            var input_buf: [read_chunk_size]u8 = undefined;
 
-        fn appendParsedInputEventsPreservingPastePrefix(
-            self: *Self,
-            results: *std.array_list.Managed(keyboard.ParseResult),
-            data: []const u8,
-            paste_start: []const u8,
-        ) !void {
-            if (data.len == 0) return;
-            const keep = pasteDelimiterPrefixSuffixLen(data, paste_start);
-            if (keep > 1 and keep < paste_start.len) {
-                const parse_len = data.len - keep;
-                try self.appendParsedInputEvents(results, data[0..parse_len]);
-                self.paste_pending_prefix.clearRetainingCapacity();
-                try self.paste_pending_prefix.appendSlice(data[parse_len..]);
-                return;
-            }
-            try self.appendParsedInputEvents(results, data);
-        }
+            var reads: usize = 0;
+            while (reads < max_reads_per_tick) : (reads += 1) {
+                const bytes_read = try self.terminal.?.readInput(&input_buf, 0);
 
-        fn appendPasteEvent(
-            self: *Self,
-            results: *std.array_list.Managed(keyboard.ParseResult),
-        ) !void {
-            const text = try self.context.allocator.dupe(u8, self.paste_buffer.items);
-            try results.append(.{ .key = .{ .key = .{ .paste = text } } });
-            self.paste_buffer.clearRetainingCapacity();
-        }
-
-        fn parseInputEvents(self: *Self, data: []const u8) ![]keyboard.ParseResult {
-            const paste_start = "\x1b[200~";
-            const paste_end = "\x1b[201~";
-            var results = std.array_list.Managed(keyboard.ParseResult).init(self.context.allocator);
-            errdefer results.deinit();
-
-            var owned_data: ?[]u8 = null;
-            defer if (owned_data) |buf| self.context.allocator.free(buf);
-            var input = data;
-            const pending_prefix = if (self.paste_active) &self.paste_pending_end_prefix else &self.paste_pending_prefix;
-            if (pending_prefix.items.len > 0) {
-                const combined = try self.context.allocator.alloc(u8, pending_prefix.items.len + data.len);
-                @memcpy(combined[0..pending_prefix.items.len], pending_prefix.items);
-                @memcpy(combined[pending_prefix.items.len..], data);
-                pending_prefix.clearRetainingCapacity();
-                owned_data = combined;
-                input = combined;
-            }
-
-            var offset: usize = 0;
-            while (offset < input.len) {
-                if (self.paste_active) {
-                    const rest = input[offset..];
-                    if (std.mem.indexOf(u8, rest, paste_end)) |end_offset| {
-                        try self.paste_buffer.appendSlice(rest[0..end_offset]);
-                        try self.appendPasteEvent(&results);
-                        self.paste_active = false;
-                        self.paste_pending_end_prefix.clearRetainingCapacity();
-                        offset += end_offset + paste_end.len;
-                    } else {
-                        const keep = pasteDelimiterPrefixSuffixLen(rest, paste_end);
-                        const append_len = rest.len - keep;
-                        try self.paste_buffer.appendSlice(rest[0..append_len]);
-                        self.paste_pending_end_prefix.clearRetainingCapacity();
-                        if (keep > 0) try self.paste_pending_end_prefix.appendSlice(rest[append_len..]);
-                        offset = input.len;
+                const events = try self.input_parser.feed(
+                    self.context.allocator,
+                    input_buf[0..bytes_read],
+                    self.context.elapsed,
+                );
+                for (events) |event| {
+                    const user_cmd = switch (event) {
+                        .key => |k| try self.processKeyEvent(k),
+                        .mouse => |m| try self.processMouseEvent(m),
+                        .none => null,
+                    };
+                    if (user_cmd) |cmd| {
+                        try self.processCommand(cmd);
                     }
-                    continue;
                 }
 
-                const rest = input[offset..];
-                if (std.mem.indexOf(u8, rest, paste_start)) |start_offset| {
-                    try self.appendParsedInputEventsPreservingPastePrefix(&results, rest[0..start_offset], paste_start);
-                    self.paste_active = true;
-                    offset += start_offset + paste_start.len;
-                } else {
-                    try self.appendParsedInputEventsPreservingPastePrefix(&results, rest, paste_start);
-                    offset = input.len;
-                }
+                // A short read means the terminal has nothing left for now.
+                if (bytes_read < input_buf.len) break;
             }
-
-            return results.toOwnedSlice();
-        }
-
-        fn pasteDelimiterPrefixSuffixLen(data: []const u8, delimiter: []const u8) usize {
-            const max = @min(data.len, delimiter.len -| 1);
-            var len = max;
-            while (len > 0) : (len -= 1) {
-                if (std.mem.eql(u8, data[data.len - len ..], delimiter[0..len])) return len;
-            }
-            return 0;
         }
 
         /// Dispatch a message to the model, applying the filter if set
-        fn dispatchToModel(self: *Self, user_msg: UserMsg) UserCmd {
-            if (self.filter) |f| {
-                if (f(user_msg)) |filtered_msg| {
-                    return self.model.update(filtered_msg, &self.context);
-                }
-                return .none;
-            }
-            return self.model.update(user_msg, &self.context);
+        fn dispatchToModel(self: *Self, user_msg: UserMsg) !UserCmd {
+            const delivered = if (self.filter) |f|
+                f(user_msg) orelse return .none
+            else
+                user_msg;
+
+            return if (comptime update_fallible)
+                try self.model.update(delivered, &self.context)
+            else
+                self.model.update(delivered, &self.context);
         }
 
-        fn processKeyEvent(self: *Self, key: keyboard.KeyEvent) ?UserCmd {
+        fn processKeyEvent(self: *Self, key: keyboard.KeyEvent) !?UserCmd {
             // Check for Ctrl+C to quit
             if (key.modifiers.ctrl) {
                 switch (key.key) {
@@ -582,12 +514,12 @@ pub fn Program(comptime Model: type) type {
             if (key.key == .paste) {
                 if (@hasField(UserMsg, "paste")) {
                     const user_msg = UserMsg{ .paste = key.key.paste };
-                    return self.dispatchToModel(user_msg);
+                    return try self.dispatchToModel(user_msg);
                 }
                 // If model doesn't handle paste, send as individual key events
                 if (@hasField(UserMsg, "key")) {
                     const user_msg = UserMsg{ .key = key };
-                    return self.dispatchToModel(user_msg);
+                    return try self.dispatchToModel(user_msg);
                 }
                 return null;
             }
@@ -595,7 +527,7 @@ pub fn Program(comptime Model: type) type {
             // Convert to user message if Model.Msg has a key variant
             if (@hasField(UserMsg, "key")) {
                 const user_msg = UserMsg{ .key = key };
-                return self.dispatchToModel(user_msg);
+                return try self.dispatchToModel(user_msg);
             }
 
             return null;
@@ -611,10 +543,10 @@ pub fn Program(comptime Model: type) type {
             return detected;
         }
 
-        fn processMouseEvent(self: *Self, mouse_event: keyboard.MouseEvent) ?UserCmd {
+        fn processMouseEvent(self: *Self, mouse_event: keyboard.MouseEvent) !?UserCmd {
             if (@hasField(UserMsg, "mouse")) {
                 const user_msg = UserMsg{ .mouse = mouse_event };
-                return self.dispatchToModel(user_msg);
+                return try self.dispatchToModel(user_msg);
             }
 
             return null;
@@ -629,30 +561,54 @@ pub fn Program(comptime Model: type) type {
                 term.cleanup();
             }
 
-            // Raise SIGTSTP to suspend process
+            // Raise SIGTSTP to suspend process. If the signal cannot be
+            // raised we simply never stop; carrying on is better than dying.
             if (builtin.os.tag != .windows) {
                 const posix = std.posix;
                 _ = posix.raise(posix.SIG.TSTP) catch {};
             }
 
-            // When we resume (after `fg`), re-setup terminal
+            // When we resume (after `fg`), re-setup terminal. A failure here
+            // leaves the terminal in the shell's mode, which renders badly but
+            // still runs -- and there is no caller to report it to.
             if (self.terminal) |*term| {
                 term.setup() catch {};
             }
 
-            // Avoid a large post-resume frame delta, and rebase the pacing anchor
-            // so we don't burst-render to "catch up" the suspended interval.
-            self.last_frame_time = self.elapsedNs();
+            // Whatever was mid-sequence when we stopped will never be
+            // completed; drop it instead of merging it with post-resume input.
+            self.input_parser.reset();
+
+            // Avoid a large post-resume delta, and rebase the pacing anchor so we
+            // don't burst-render to "catch up" the suspended interval. Advance the
+            // user-visible clock to "now" so the timer checks below run against a
+            // consistent post-resume `elapsed`.
+            const resume_elapsed = self.elapsedNs();
+            self.last_frame_time = resume_elapsed;
+            self.context.elapsed = resume_elapsed;
             self.pacing_epoch = std.Io.Clock.Timestamp.now(self.io, .boot);
             self.pacing_frame_offset = self.context.frame;
 
-            // Force re-render
-            self.last_view_hash = 0;
+            // Re-anchor the timers to "now" so the first post-resume Tick.delta is a
+            // normal interval rather than the whole suspended span (mirrors the
+            // last_frame_time and pacing resets above: we resume the cadence from
+            // here instead of bursting to catch up the suspended time). The
+            // repeating timer fires one interval after resume; an already-overdue
+            // one-shot fires next with a ~zero delta. Anchoring to `resume_elapsed`
+            // (== context.elapsed) also keeps the later `elapsed - last_every_tick`
+            // subtraction from underflowing.
+            self.last_every_tick = resume_elapsed;
+            self.pending_tick_scheduled_at = resume_elapsed;
+
+            // The terminal was handed back to the shell in between, so nothing
+            // about the previous frame can be relied on.
+            self.invalidate();
 
             // Dispatch resumed message if model supports it
             if (@hasField(UserMsg, "resumed")) {
-                const cmd = self.dispatchToModel(.{ .resumed = {} });
-                self.processCommand(cmd) catch {};
+                if (self.dispatchToModel(.{ .resumed = {} })) |cmd| {
+                    self.processCommand(cmd) catch {};
+                } else |_| {}
             }
         }
 
@@ -664,6 +620,7 @@ pub fn Program(comptime Model: type) type {
                 },
                 .tick => |ns| {
                     self.pending_tick = self.context.elapsed + ns;
+                    self.pending_tick_scheduled_at = self.context.elapsed;
                 },
                 .every => |ns| {
                     self.every_interval = ns;
@@ -680,12 +637,12 @@ pub fn Program(comptime Model: type) type {
                     }
                 },
                 .msg => |m| {
-                    const new_cmd = self.dispatchToModel(m);
+                    const new_cmd = try self.dispatchToModel(m);
                     try self.processCommand(new_cmd);
                 },
                 .perform => |func| {
                     if (func()) |m| {
-                        const new_cmd = self.dispatchToModel(m);
+                        const new_cmd = try self.dispatchToModel(m);
                         try self.processCommand(new_cmd);
                     }
                 },
@@ -722,6 +679,8 @@ pub fn Program(comptime Model: type) type {
                         try writer.writeAll(ansi.alt_screen_enter);
                         try term.flush();
                     }
+                    // Switching buffers swaps out everything on screen.
+                    self.invalidate();
                 },
                 .exit_alt_screen => {
                     if (self.terminal) |*term| {
@@ -729,6 +688,10 @@ pub fn Program(comptime Model: type) type {
                         try writer.writeAll(ansi.alt_screen_exit);
                         try term.flush();
                     }
+                    self.invalidate();
+                },
+                .repaint => {
+                    self.invalidate();
                 },
                 .set_title => |title| {
                     if (self.terminal) |*term| {
@@ -747,6 +710,8 @@ pub fn Program(comptime Model: type) type {
                         try writer.writeAll(ansi.cursor_restore);
                         try term.flush();
                     }
+                    // This wrote over the frame area.
+                    self.invalidate();
                 },
                 .image_file => |image| {
                     self.pending_image = .{ .auto = image };
@@ -759,27 +724,30 @@ pub fn Program(comptime Model: type) type {
                 },
                 .cache_image => |cache| {
                     if (self.terminal) |*term| {
+                        // An unsupported protocol returns false rather than an
+                        // error, so anything that does surface here is a real
+                        // I/O failure, the same as in `flushPendingImage`.
                         switch (cache.source) {
                             .file => |path| {
-                                _ = term.transmitKittyImageFromFile(path, .{
+                                _ = try term.transmitKittyImageFromFile(path, .{
                                     .image_id = cache.image_id,
                                     .format = @enumFromInt(@intFromEnum(cache.format)),
                                     .quiet = cache.quiet,
                                     .pixel_width = cache.pixel_width,
                                     .pixel_height = cache.pixel_height,
-                                }) catch {};
+                                });
                             },
                             .data => |data| {
-                                _ = term.transmitKittyImage(data, .{
+                                _ = try term.transmitKittyImage(data, .{
                                     .image_id = cache.image_id,
                                     .format = @enumFromInt(@intFromEnum(cache.format)),
                                     .quiet = cache.quiet,
                                     .pixel_width = cache.pixel_width,
                                     .pixel_height = cache.pixel_height,
-                                }) catch {};
+                                });
                             },
                         }
-                        term.flush() catch {};
+                        try term.flush();
                     }
                 },
                 .place_cached_image => |place| {
@@ -792,8 +760,8 @@ pub fn Program(comptime Model: type) type {
                             .by_placement => |bp| .{ .by_placement = .{ .image_id = bp.image_id, .placement_id = bp.placement_id } },
                             .all => .all,
                         };
-                        _ = term.deleteKittyImage(target) catch {};
-                        term.flush() catch {};
+                        _ = try term.deleteKittyImage(target);
+                        try term.flush();
                     }
                 },
             }
@@ -899,6 +867,9 @@ pub fn Program(comptime Model: type) type {
                     },
                 }
                 try term.flush();
+                // An image covers cells the renderer thinks it owns; the next
+                // frame repaints over it the way a full redraw always did.
+                self.invalidate();
             }
         }
 
@@ -999,11 +970,6 @@ pub fn Program(comptime Model: type) type {
             return @intCast(ns);
         }
 
-        fn sleepNs(io: std.Io, nanoseconds: u64) void {
-            if (nanoseconds == 0) return;
-            std.Io.sleep(io, .fromNanoseconds(nanoseconds), .boot) catch unreachable;
-        }
-
         fn resetFrameAllocator(self: *Self) void {
             _ = self.arena.reset(.retain_capacity);
             self.context.allocator = self.arena.allocator();
@@ -1013,7 +979,10 @@ pub fn Program(comptime Model: type) type {
 
         fn render(self: *Self) !void {
             if (self.resize_deadline != null) return;
-            const view_output = self.model.view(&self.context);
+            const view_output = if (comptime view_fallible)
+                try self.model.view(&self.context)
+            else
+                self.model.view(&self.context);
 
             // Compute hash of view output
             const view_hash = std.hash.Wyhash.hash(0, view_output);
@@ -1163,6 +1132,17 @@ pub fn Program(comptime Model: type) type {
             }
         }
 
+        /// Repaint the whole frame on the next render. Our inline renderer
+        /// keeps its own row-diff state, so invalidating means asking for a
+        /// repaint and forgetting what the previous frame occupied.
+        pub fn invalidate(self: *Self) void {
+            self.needs_repaint = true;
+            self.last_line_count = 0;
+            self.last_line_widths.clearRetainingCapacity();
+            self.last_frame.clearRetainingCapacity();
+            self.resize_deadline = null;
+        }
+
         fn finishInline(self: *Self) void {
             if (self.terminal) |*term| {
                 const writer = term.writer();
@@ -1220,7 +1200,7 @@ pub fn Program(comptime Model: type) type {
         /// Background-thread sends enqueue for main-thread delivery.
         pub fn send(self: *Self, m: UserMsg) !void {
             if (std.Thread.getCurrentId() == self.main_thread_id) {
-                const cmd = self.dispatchToModel(m);
+                const cmd = try self.dispatchToModel(m);
                 try self.processCommand(cmd);
                 return;
             }

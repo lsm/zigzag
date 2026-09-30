@@ -391,7 +391,7 @@ pub fn List(comptime T: type) type {
             }
 
             if (self.cursor >= self.filtered_indices.items.len and self.filtered_indices.items.len > 0) {
-                self.cursor = self.filtered_indices.items.len - 1;
+                self.cursor = 0;
             }
             self.ensureVisible();
         }
