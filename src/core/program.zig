@@ -1196,6 +1196,7 @@ pub fn Program(comptime Model: type) type {
         fn writeClampedLine(writer: *std.Io.Writer, line: []const u8, width: usize) !usize {
             var i: usize = 0;
             var used: usize = 0;
+            var clipped = false;
             while (i < line.len) {
                 const c = line[i];
                 if (c == 0x1b) {
@@ -1208,7 +1209,11 @@ pub fn Program(comptime Model: type) type {
                 const take = @min(len, line.len - i);
                 const codepoint: u21 = std.unicode.utf8Decode(line[i .. i + take]) catch c;
                 const cell_width = unicode.charWidth(codepoint);
-                if (used + cell_width > width) {
+                if (clipped or used + cell_width > width) {
+                    // Past the truncation point: drop printable characters so a
+                    // wide glyph straddling the edge cannot pull later text in,
+                    // but keep emitting escape sequences (trailing resets).
+                    clipped = true;
                     i += take;
                     continue;
                 }
@@ -1377,5 +1382,25 @@ test "scrollLiveRegionAway leaves the cursor at the bottom row" {
     try std.testing.expectEqual(@as(usize, 10), std.mem.count(u8, out.written(), "\r\n"));
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "\x1b[H") == null);
     try std.testing.expectEqual(true, program.bottom_anchor);
+}
+
+test "writeClampedLine stops at a wide character that crosses the edge" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    const used = try Program(AnchorTestModel).writeClampedLine(&out.writer, "123456789漢ab", 10);
+
+    // The wide glyph does not fit the last cell, so truncation stops before it
+    // and the trailing 'a' from beyond the boundary is not pulled in.
+    try std.testing.expectEqualStrings("123456789", out.written());
+    try std.testing.expectEqual(@as(usize, 9), used);
+}
+
+test "writeClampedLine still flushes escape sequences past the edge" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    _ = try Program(AnchorTestModel).writeClampedLine(&out.writer, "123456789漢\x1b[0m", 10);
+
+    // The reset after the truncation point is still written.
+    try std.testing.expectEqualStrings("123456789\x1b[0m", out.written());
 }
 
