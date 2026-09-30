@@ -1480,4 +1480,3 @@ test "reanchorInline drops the stale frame and re-anchors at the bottom" {
     try std.testing.expectEqual(@as(usize, 0), program.last_line_widths.items.len);
     try std.testing.expectEqual(true, program.needs_repaint);
 }
-

@@ -170,4 +170,3 @@ test "Program.send dispatches same-thread frame-backed payloads immediately" {
     try program.send(.{ .text = text });
     try testing.expectEqualSlices(u8, "frame-text-42", program.model.last_text);
 }
-
