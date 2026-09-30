@@ -941,6 +941,12 @@ By default (`null`/`auto`), ZigZag:
 `view()` returns the whole frame as a string; the runtime works out what to
 send to the terminal.
 
+In this fork, `Program` draws with its own renderer, not `zz.FrameRenderer`.
+In inline mode (`inline_bottom_viewport`), `render_mode = .diff` skips rows
+that match the previous frame and `.full` rewrites every row; the full-screen
+path always rewrites every row. The fallback rules below describe
+`zz.FrameRenderer` used on its own.
+
 With the default `render_mode = .diff`, a frame is compared line by line
 against the one before it and only the rows that changed are rewritten. An
 animated spinner next to a screenful of streaming text costs a few dozen bytes

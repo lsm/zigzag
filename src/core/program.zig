@@ -1091,7 +1091,7 @@ pub fn Program(comptime Model: type) type {
             }
             try writeAboveLines(writer, above, width);
 
-            const reuse = above.len == 0 and self.last_line_count > 0;
+            const reuse = self.options.render_mode == .diff and above.len == 0 and self.last_line_count > 0;
             var old_lines = std.mem.splitScalar(u8, self.last_frame.items, '\n');
             var next_frame: std.ArrayList(u8) = .empty;
             defer next_frame.deinit(self.allocator);
@@ -1417,6 +1417,32 @@ test "invalidate outside inline mode forgets the previous frame's rows but keeps
     try std.testing.expectEqual(@as(usize, 0), program.last_line_widths.items.len);
     try std.testing.expectEqual(@as(?u64, 42), program.resize_deadline);
     try std.testing.expect(program.needs_repaint);
+}
+
+test "render_mode full rewrites the unchanged rows that diff skips" {
+    var env_map: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env_map.deinit();
+
+    for ([_]bool{ false, true }) |full| {
+        var program = Program(AnchorTestModel).init(std.testing.allocator, std.testing.io, &env_map);
+        defer program.deinit();
+        program.options.inline_bottom_viewport = true;
+        program.options.render_mode = if (full) .full else .diff;
+        program.context.allocator = program.arena.allocator();
+        program.context.width = 40;
+        program.context.height = 10;
+
+        var first: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer first.deinit();
+        try program.renderInlineFrame(&first.writer, "one\ntwo", "");
+
+        var second: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer second.deinit();
+        try program.renderInlineFrame(&second.writer, "one\ntwo", "");
+
+        const rewrote_first_row = std.mem.indexOf(u8, second.written(), "one") != null;
+        try std.testing.expectEqual(full, rewrote_first_row);
+    }
 }
 
 test "scrollLiveRegionAway leaves the cursor at the bottom row" {

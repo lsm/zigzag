@@ -431,11 +431,11 @@ pub const Options = struct {
     /// sequences arrive in pieces over a slow link (ssh, serial).
     escape_timeout_ms: u32 = 50,
 
-    /// How a new frame is pushed to the terminal.
+    /// How an inline frame (`inline_bottom_viewport`) is pushed to the terminal.
     ///
-    /// `.diff` rewrites only the lines that changed since the previous frame,
-    /// which is what keeps a spinner or a streaming log from costing a full
-    /// screen of output several times a second. It falls back to a full
-    /// repaint on its own whenever the screen cannot be addressed by row.
+    /// `.diff` skips the rows that match the previous frame, which is what
+    /// keeps a spinner next to a streaming log from costing a full repaint
+    /// several times a second. `.full` rewrites every row of every frame. The
+    /// full-screen path always rewrites every row.
     render_mode: frame_mod.Mode = .diff,
 };
