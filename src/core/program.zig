@@ -1162,14 +1162,16 @@ pub fn Program(comptime Model: type) type {
             }
         }
 
-        /// Repaint the whole frame on the next render. Our inline renderer
-        /// keeps its own row-diff state, so invalidating means asking for a
-        /// repaint and forgetting what the previous frame occupied.
+        /// Repaint the whole frame on the next render. The inline renderer
+        /// still has to find the top of the rows it drew and still owes a
+        /// pending resize relayout, so inline mode only drops the row-diff
+        /// cache; the full-screen path forgets the previous frame entirely.
         pub fn invalidate(self: *Self) void {
             self.needs_repaint = true;
+            self.last_frame.clearRetainingCapacity();
+            if (self.options.inline_bottom_viewport) return;
             self.last_line_count = 0;
             self.last_line_widths.clearRetainingCapacity();
-            self.last_frame.clearRetainingCapacity();
             self.resize_deadline = null;
         }
 
@@ -1366,6 +1368,56 @@ test "renderInlineFrame anchors a short frame to the bottom after a scroll" {
     try std.testing.expect(std.mem.startsWith(u8, out.written(), "\r\x1b[1A"));
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "\x1b[H") == null);
     try std.testing.expectEqual(false, program.bottom_anchor);
+}
+
+test "invalidate in inline mode repaints every row in place and keeps a pending relayout" {
+    var env_map: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env_map.deinit();
+
+    var program = Program(AnchorTestModel).init(std.testing.allocator, std.testing.io, &env_map);
+    defer program.deinit();
+    program.options.inline_bottom_viewport = true;
+    program.context.allocator = program.arena.allocator();
+    program.context.width = 40;
+    program.context.height = 10;
+
+    var first: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer first.deinit();
+    try program.renderInlineFrame(&first.writer, "one\ntwo", "");
+
+    program.resize_deadline = 42;
+    program.invalidate();
+    try std.testing.expectEqual(@as(?u64, 42), program.resize_deadline);
+    try std.testing.expect(program.needs_repaint);
+
+    var second: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer second.deinit();
+    try program.renderInlineFrame(&second.writer, "one\ntwo", "");
+
+    // The next frame starts back at the top of the two rows it replaces, and
+    // rewrites both even though neither changed.
+    try std.testing.expect(std.mem.startsWith(u8, second.written(), "\x1b[1A\r"));
+    try std.testing.expect(std.mem.indexOf(u8, second.written(), "one") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second.written(), "two") != null);
+}
+
+test "invalidate outside inline mode forgets the rows and relayout of the previous frame" {
+    var env_map: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env_map.deinit();
+
+    var program = Program(AnchorTestModel).init(std.testing.allocator, std.testing.io, &env_map);
+    defer program.deinit();
+    program.options.inline_bottom_viewport = false;
+    program.last_line_count = 3;
+    try program.last_line_widths.append(program.allocator, 5);
+    program.resize_deadline = 42;
+
+    program.invalidate();
+
+    try std.testing.expectEqual(@as(usize, 0), program.last_line_count);
+    try std.testing.expectEqual(@as(usize, 0), program.last_line_widths.items.len);
+    try std.testing.expectEqual(@as(?u64, null), program.resize_deadline);
+    try std.testing.expect(program.needs_repaint);
 }
 
 test "scrollLiveRegionAway leaves the cursor at the bottom row" {
