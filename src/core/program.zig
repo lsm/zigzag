@@ -465,19 +465,27 @@ pub fn Program(comptime Model: type) type {
                     input_buf[0..bytes_read],
                     self.context.elapsed,
                 );
-                for (events) |event| {
-                    const user_cmd = switch (event) {
-                        .key => |k| try self.processKeyEvent(k),
-                        .mouse => |m| try self.processMouseEvent(m),
-                        .none => null,
-                    };
-                    if (user_cmd) |cmd| {
-                        try self.processCommand(cmd);
-                    }
-                }
+                try self.dispatchInputEvents(events);
+                if (!self.isRunning()) return;
 
                 // A short read means the terminal has nothing left for now.
                 if (bytes_read < input_buf.len) break;
+            }
+        }
+
+        /// Hand parsed input to the model in order, stopping at the event that
+        /// quits: nothing typed after it may reach the model or suspend us.
+        fn dispatchInputEvents(self: *Self, events: []const keyboard.ParseResult) !void {
+            for (events) |event| {
+                const user_cmd = switch (event) {
+                    .key => |k| try self.processKeyEvent(k),
+                    .mouse => |m| try self.processMouseEvent(m),
+                    .none => null,
+                };
+                if (user_cmd) |cmd| {
+                    try self.processCommand(cmd);
+                    if (!self.isRunning()) return;
+                }
             }
         }
 
@@ -1343,6 +1351,48 @@ const AnchorTestModel = struct {
         return "one\ntwo";
     }
 };
+
+const QuitTestModel = struct {
+    pub const Msg = union(enum) { key: keyboard.KeyEvent };
+
+    keys: usize = 0,
+
+    pub fn init(_: *QuitTestModel, _: *Context) Cmd(QuitTestModel.Msg) {
+        return .none;
+    }
+
+    pub fn update(self: *QuitTestModel, msg: QuitTestModel.Msg, _: *Context) Cmd(QuitTestModel.Msg) {
+        switch (msg) {
+            .key => |k| {
+                self.keys += 1;
+                if (k.key == .char and k.key.char == 'q') return .quit;
+            },
+        }
+        return .none;
+    }
+
+    pub fn view(_: *const QuitTestModel, _: *const Context) []const u8 {
+        return "";
+    }
+};
+
+test "dispatchInputEvents stops at the quit and hands nothing after it to the model" {
+    var env_map: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env_map.deinit();
+
+    var program = Program(QuitTestModel).init(std.testing.allocator, std.testing.io, &env_map);
+    defer program.deinit();
+    program.running.store(true, .release);
+
+    const events = [_]keyboard.ParseResult{
+        .{ .key = .{ .key = .{ .char = 'q' } } },
+        .{ .key = .{ .key = .{ .char = 'x' } } },
+    };
+    try program.dispatchInputEvents(&events);
+
+    try std.testing.expect(!program.isRunning());
+    try std.testing.expectEqual(@as(usize, 1), program.model.keys);
+}
 
 test "renderInlineFrame anchors a short frame to the bottom after a scroll" {
     var env_map: std.process.Environ.Map = .init(std.testing.allocator);
