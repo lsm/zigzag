@@ -84,14 +84,14 @@ pub fn exitAltScreen(state: *State, writer: *Writer) !void {
 /// Enable mouse tracking.
 pub fn enableMouse(state: *State, writer: *Writer) !void {
     if (state.mouse_enabled) return;
-    try writer.writeAll("\x1b[?1003h\x1b[?1006h");
+    try writer.writeAll("\x1b[?1000h\x1b[?1006h");
     state.mouse_enabled = true;
 }
 
 /// Disable mouse tracking.
 pub fn disableMouse(state: *State, writer: *Writer) !void {
     if (!state.mouse_enabled) return;
-    try writer.writeAll("\x1b[?1006l\x1b[?1003l");
+    try writer.writeAll("\x1b[?1006l\x1b[?1000l");
     state.mouse_enabled = false;
 }
 

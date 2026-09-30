@@ -1,6 +1,5 @@
 //! Program runtime for the ZigZag TUI framework.
 //! Implements the Model-Update-View pattern with an event loop.
-
 const std = @import("std");
 const builtin = @import("builtin");
 const Terminal = @import("../terminal/terminal.zig").Terminal;
@@ -73,8 +72,18 @@ pub fn Program(comptime Model: type) type {
         last_every_tick: u64,
         last_view_hash: u64,
         last_line_count: usize,
+        needs_repaint: bool,
+        resize_deadline: ?u64,
+        bottom_anchor: bool,
+        last_line_widths: std.ArrayList(usize),
+        last_frame: std.ArrayList(u8),
+        relayout_above_split: ?usize,
         pending_image: ?PendingImage,
         logger: ?Logger,
+        paste_buffer: std.array_list.Managed(u8),
+        paste_pending_prefix: std.array_list.Managed(u8),
+        paste_pending_end_prefix: std.array_list.Managed(u8),
+        paste_active: bool,
 
         /// Message filter function
         filter: ?*const fn (UserMsg) ?UserMsg,
@@ -168,8 +177,18 @@ pub fn Program(comptime Model: type) type {
                 .last_every_tick = 0,
                 .last_view_hash = 0,
                 .last_line_count = 0,
+                .needs_repaint = false,
+                .resize_deadline = null,
+                .bottom_anchor = false,
+                .last_line_widths = .empty,
+                .last_frame = .empty,
+                .relayout_above_split = null,
                 .pending_image = null,
                 .logger = null,
+                .paste_buffer = std.array_list.Managed(u8).init(allocator),
+                .paste_pending_prefix = std.array_list.Managed(u8).init(allocator),
+                .paste_pending_end_prefix = std.array_list.Managed(u8).init(allocator),
+                .paste_active = false,
                 .filter = null,
             };
 
@@ -188,7 +207,13 @@ pub fn Program(comptime Model: type) type {
             if (self.logger) |*l| {
                 l.deinit();
             }
+            self.context.deinit();
+            self.last_line_widths.deinit(self.allocator);
+            self.last_frame.deinit(self.allocator);
             self.message_queue.deinit();
+            self.paste_buffer.deinit();
+            self.paste_pending_prefix.deinit();
+            self.paste_pending_end_prefix.deinit();
             self.arena.deinit();
 
             // Call model's deinit if it exists
@@ -211,6 +236,8 @@ pub fn Program(comptime Model: type) type {
             while (self.running.load(.acquire)) {
                 try self.tick();
             }
+
+            if (self.options.inline_bottom_viewport) self.finishInline();
         }
 
         /// Initialize the terminal and model without entering the event loop.
@@ -239,6 +266,8 @@ pub fn Program(comptime Model: type) type {
                 .alt_screen = self.options.alt_screen,
                 .hide_cursor = !self.options.cursor,
                 .mouse = self.options.mouse,
+                .alternate_scroll = self.options.alternate_scroll,
+                .clear_on_setup = !self.options.inline_bottom_viewport,
                 .bracketed_paste = self.options.bracketed_paste,
                 .input = self.options.input,
                 .output = self.options.output,
@@ -299,6 +328,7 @@ pub fn Program(comptime Model: type) type {
             // Drain queued messages before resetting the frame arena. This preserves
             // payloads created from the previous frame allocator until delivery.
             try self.drainMessageQueue();
+            if (!self.isRunning()) return;
 
             self.resetFrameAllocator();
 
@@ -307,14 +337,21 @@ pub fn Program(comptime Model: type) type {
                 const size = try self.terminal.?.getSize();
                 self.context.width = size.cols;
                 self.context.height = size.rows;
-
-                // Only send window_size message if the user model supports it
-                if (@hasField(UserMsg, "window_size")) {
-                    const cmd = self.dispatchToModel(.{ .window_size = .{
-                        .width = size.cols,
-                        .height = size.rows,
-                    } });
-                    try self.processCommand(cmd);
+                self.resize_deadline = self.context.elapsed + resize_debounce_ns;
+            }
+            if (self.resize_deadline) |deadline| {
+                if (self.context.elapsed >= deadline) {
+                    self.resize_deadline = null;
+                    self.needs_repaint = true;
+                    if (self.options.inline_bottom_viewport) self.relayout_above_split = self.context.above_buffer.items.len;
+                    if (@hasField(UserMsg, "window_size")) {
+                        const cmd = self.dispatchToModel(.{ .window_size = .{
+                            .width = self.context.width,
+                            .height = self.context.height,
+                        } });
+                        try self.processCommand(cmd);
+                        if (!self.isRunning()) return;
+                    }
                 }
             }
 
@@ -323,7 +360,7 @@ pub fn Program(comptime Model: type) type {
             const bytes_read = try self.terminal.?.readInput(&input_buf, 0);
 
             if (bytes_read > 0) {
-                const events = try keyboard.parseAll(self.context.allocator, input_buf[0..bytes_read]);
+                const events = try self.parseInputEvents(input_buf[0..bytes_read]);
                 for (events) |event| {
                     const user_cmd = switch (event) {
                         .key => |k| self.processKeyEvent(k),
@@ -332,6 +369,7 @@ pub fn Program(comptime Model: type) type {
                     };
                     if (user_cmd) |cmd| {
                         try self.processCommand(cmd);
+                        if (!self.isRunning()) return;
                     }
                 }
             }
@@ -348,6 +386,7 @@ pub fn Program(comptime Model: type) type {
                         } };
                         const cmd = self.dispatchToModel(user_msg);
                         try self.processCommand(cmd);
+                        if (!self.isRunning()) return;
                     }
                 }
             }
@@ -363,6 +402,7 @@ pub fn Program(comptime Model: type) type {
                         } };
                         const cmd = self.dispatchToModel(user_msg);
                         try self.processCommand(cmd);
+                        if (!self.isRunning()) return;
                     }
                 }
             }
@@ -411,6 +451,106 @@ pub fn Program(comptime Model: type) type {
             }
         }
 
+        fn appendParsedInputEvents(
+            self: *Self,
+            results: *std.array_list.Managed(keyboard.ParseResult),
+            data: []const u8,
+        ) !void {
+            if (data.len == 0) return;
+            const parsed = try keyboard.parseAll(self.context.allocator, data);
+            try results.appendSlice(parsed);
+        }
+
+        fn appendParsedInputEventsPreservingPastePrefix(
+            self: *Self,
+            results: *std.array_list.Managed(keyboard.ParseResult),
+            data: []const u8,
+            paste_start: []const u8,
+        ) !void {
+            if (data.len == 0) return;
+            const keep = pasteDelimiterPrefixSuffixLen(data, paste_start);
+            if (keep > 1 and keep < paste_start.len) {
+                const parse_len = data.len - keep;
+                try self.appendParsedInputEvents(results, data[0..parse_len]);
+                self.paste_pending_prefix.clearRetainingCapacity();
+                try self.paste_pending_prefix.appendSlice(data[parse_len..]);
+                return;
+            }
+            try self.appendParsedInputEvents(results, data);
+        }
+
+        fn appendPasteEvent(
+            self: *Self,
+            results: *std.array_list.Managed(keyboard.ParseResult),
+        ) !void {
+            const text = try self.context.allocator.dupe(u8, self.paste_buffer.items);
+            try results.append(.{ .key = .{ .key = .{ .paste = text } } });
+            self.paste_buffer.clearRetainingCapacity();
+        }
+
+        fn parseInputEvents(self: *Self, data: []const u8) ![]keyboard.ParseResult {
+            const paste_start = "\x1b[200~";
+            const paste_end = "\x1b[201~";
+            var results = std.array_list.Managed(keyboard.ParseResult).init(self.context.allocator);
+            errdefer results.deinit();
+
+            var owned_data: ?[]u8 = null;
+            defer if (owned_data) |buf| self.context.allocator.free(buf);
+            var input = data;
+            const pending_prefix = if (self.paste_active) &self.paste_pending_end_prefix else &self.paste_pending_prefix;
+            if (pending_prefix.items.len > 0) {
+                const combined = try self.context.allocator.alloc(u8, pending_prefix.items.len + data.len);
+                @memcpy(combined[0..pending_prefix.items.len], pending_prefix.items);
+                @memcpy(combined[pending_prefix.items.len..], data);
+                pending_prefix.clearRetainingCapacity();
+                owned_data = combined;
+                input = combined;
+            }
+
+            var offset: usize = 0;
+            while (offset < input.len) {
+                if (self.paste_active) {
+                    const rest = input[offset..];
+                    if (std.mem.indexOf(u8, rest, paste_end)) |end_offset| {
+                        try self.paste_buffer.appendSlice(rest[0..end_offset]);
+                        try self.appendPasteEvent(&results);
+                        self.paste_active = false;
+                        self.paste_pending_end_prefix.clearRetainingCapacity();
+                        offset += end_offset + paste_end.len;
+                    } else {
+                        const keep = pasteDelimiterPrefixSuffixLen(rest, paste_end);
+                        const append_len = rest.len - keep;
+                        try self.paste_buffer.appendSlice(rest[0..append_len]);
+                        self.paste_pending_end_prefix.clearRetainingCapacity();
+                        if (keep > 0) try self.paste_pending_end_prefix.appendSlice(rest[append_len..]);
+                        offset = input.len;
+                    }
+                    continue;
+                }
+
+                const rest = input[offset..];
+                if (std.mem.indexOf(u8, rest, paste_start)) |start_offset| {
+                    try self.appendParsedInputEventsPreservingPastePrefix(&results, rest[0..start_offset], paste_start);
+                    self.paste_active = true;
+                    offset += start_offset + paste_start.len;
+                } else {
+                    try self.appendParsedInputEventsPreservingPastePrefix(&results, rest, paste_start);
+                    offset = input.len;
+                }
+            }
+
+            return results.toOwnedSlice();
+        }
+
+        fn pasteDelimiterPrefixSuffixLen(data: []const u8, delimiter: []const u8) usize {
+            const max = @min(data.len, delimiter.len -| 1);
+            var len = max;
+            while (len > 0) : (len -= 1) {
+                if (std.mem.eql(u8, data[data.len - len ..], delimiter[0..len])) return len;
+            }
+            return 0;
+        }
+
         /// Dispatch a message to the model, applying the filter if set
         fn dispatchToModel(self: *Self, user_msg: UserMsg) UserCmd {
             if (self.filter) |f| {
@@ -427,9 +567,8 @@ pub fn Program(comptime Model: type) type {
             if (key.modifiers.ctrl) {
                 switch (key.key) {
                     .char => |c| {
-                        if (c == 'c') {
-                            self.running.store(false, .release);
-                            return null;
+                        if (c == 'c' and self.options.ctrl_c_quits) {
+                            return .quit;
                         }
                         // Handle Ctrl+Z for suspend
                         if (c == 'z' and self.options.suspend_enabled) {
@@ -501,6 +640,21 @@ pub fn Program(comptime Model: type) type {
             // When we resume (after `fg`), re-setup terminal
             if (self.terminal) |*term| {
                 term.setup() catch {};
+            }
+
+            // The shell wrote its prompt and `fg` output while we were stopped,
+            // so the cursor no longer marks the live region. Scroll to a known
+            // row and re-anchor the next frame there; forget the old frame so
+            // the reuse path cannot skip rows the shell overwrote.
+            if (self.options.inline_bottom_viewport) {
+                if (self.terminal) |*term| {
+                    const writer = term.writer();
+                    const height: usize = @max(@as(usize, self.context.height), 1);
+                    var n: usize = 0;
+                    while (n < height) : (n += 1) writer.writeAll("\r\n") catch break;
+                    term.flush() catch {};
+                }
+                self.reanchorInline();
             }
 
             // Avoid a large post-resume frame delta, and rebase the pacing anchor
@@ -599,7 +753,9 @@ pub fn Program(comptime Model: type) type {
                     }
                 },
                 .println => |line| {
-                    if (self.terminal) |*term| {
+                    if (self.options.inline_bottom_viewport) {
+                        try self.context.printAbove(line);
+                    } else if (self.terminal) |*term| {
                         const writer = term.writer();
                         try writer.writeAll(ansi.cursor_save);
                         try writer.writeAll(ansi.cursor_home);
@@ -870,23 +1026,41 @@ pub fn Program(comptime Model: type) type {
             self.context.allocator = self.arena.allocator();
         }
 
+        const resize_debounce_ns: u64 = 150 * std.time.ns_per_ms;
+
         fn render(self: *Self) !void {
+            if (self.resize_deadline != null) return;
             const view_output = self.model.view(&self.context);
 
             // Compute hash of view output
             const view_hash = std.hash.Wyhash.hash(0, view_output);
+            const has_above = self.context.hasPendingAbove();
+            if (view_hash == self.last_view_hash and !has_above and !self.needs_repaint and !self.context.clear_screen_requested) return;
 
-            // Only redraw if view changed
-            if (view_hash != self.last_view_hash) {
-                const writer = self.terminal.?.writer();
+            const writer = self.terminal.?.writer();
+            // Start synchronized output (prevents tearing on supporting terminals)
+            try writer.writeAll(ansi.sync_start);
+            if (self.context.clear_screen_requested) {
+                self.context.clear_screen_requested = false;
+                try writer.writeAll(ansi.screen_clear);
+                try writer.writeAll(ansi.CSI ++ "3J");
+                try writer.writeAll(ansi.cursor_home);
+                self.last_line_count = 0;
+                self.last_line_widths.clearRetainingCapacity();
+            }
 
-                // Start synchronized output (prevents tearing on supporting terminals)
-                try writer.writeAll(ansi.sync_start);
-
+            if (self.options.inline_bottom_viewport) {
+                var above: []const u8 = self.context.above_buffer.items;
+                if (self.relayout_above_split) |split| {
+                    self.relayout_above_split = null;
+                    const at = @min(split, above.len);
+                    try self.scrollLiveRegionAway(writer, above[0..at]);
+                    above = above[at..];
+                }
+                try self.renderInlineFrame(writer, view_output, above);
+            } else {
                 // Move cursor home (don't clear entire screen to reduce flicker)
                 try writer.writeAll(ansi.cursor_home);
-
-                // Write each line, clearing to end of line
                 var lines = std.mem.splitScalar(u8, view_output, '\n');
                 var first = true;
                 var line_count: usize = 0;
@@ -897,8 +1071,6 @@ pub fn Program(comptime Model: type) type {
                     try writer.writeAll(ansi.line_clear_right);
                     line_count += 1;
                 }
-
-                // Clear remaining lines if previous content was taller
                 if (self.last_line_count > line_count) {
                     var remaining = self.last_line_count - line_count;
                     while (remaining > 0) : (remaining -= 1) {
@@ -907,15 +1079,183 @@ pub fn Program(comptime Model: type) type {
                     }
                 }
                 self.last_line_count = line_count;
-
-                // End synchronized output
-                try writer.writeAll(ansi.sync_end);
-
-                try self.terminal.?.flush();
-
-                // Save hash for comparison
-                self.last_view_hash = view_hash;
             }
+            self.context.above_buffer.clearRetainingCapacity();
+
+            // End synchronized output
+            try writer.writeAll(ansi.sync_end);
+            try self.terminal.?.flush();
+
+            // Save hash for comparison
+            self.last_view_hash = view_hash;
+            self.needs_repaint = false;
+        }
+
+        fn renderInlineFrame(self: *Self, writer: *std.Io.Writer, view_output: []const u8, above: []const u8) !void {
+            const height: usize = @max(@as(usize, self.context.height), 1);
+            const width: usize = @max(@as(usize, self.context.width), 1);
+
+            var frame_lines: std.ArrayList([]const u8) = .empty;
+            defer frame_lines.deinit(self.allocator);
+            var skip = countLines(view_output) -| height;
+            var lines = std.mem.splitScalar(u8, view_output, '\n');
+            while (lines.next()) |line| {
+                if (skip > 0) {
+                    skip -= 1;
+                    continue;
+                }
+                try frame_lines.append(self.allocator, line);
+            }
+
+            if (self.bottom_anchor) {
+                // The cursor rests on the bottom row (scrollLiveRegionAway left
+                // it there), so anchor the frame's last row to that row instead
+                // of homing it to the top-left.
+                self.bottom_anchor = false;
+                try writer.writeAll("\r");
+                if (frame_lines.items.len > 1) {
+                    const up: u16 = @intCast(@min(frame_lines.items.len - 1, std.math.maxInt(u16)));
+                    try ansi.cursorUp(writer, up);
+                }
+            } else {
+                try self.moveToLiveRegionTop(writer);
+            }
+            try writeAboveLines(writer, above, width);
+
+            const reuse = above.len == 0 and self.last_line_count > 0;
+            var old_lines = std.mem.splitScalar(u8, self.last_frame.items, '\n');
+            var next_frame: std.ArrayList(u8) = .empty;
+            defer next_frame.deinit(self.allocator);
+            self.last_line_widths.clearRetainingCapacity();
+            for (frame_lines.items, 0..) |line, i| {
+                const old = old_lines.next();
+                if (i > 0) try next_frame.append(self.allocator, '\n');
+                try next_frame.appendSlice(self.allocator, line);
+                try self.last_line_widths.append(self.allocator, @min(inkWidth(line), width));
+                if (i + 1 == frame_lines.items.len) {
+                    try writer.writeAll(ansi.screen_clear_below);
+                    _ = try writeClampedLine(writer, line, width);
+                    break;
+                }
+                const unchanged = reuse and i + 1 < self.last_line_count and old != null and std.mem.eql(u8, old.?, line);
+                if (unchanged) {
+                    try writer.writeAll("\n");
+                    continue;
+                }
+                const used = try writeClampedLine(writer, line, width);
+                if (used < width) try writer.writeAll(ansi.line_clear_right);
+                try writer.writeAll("\r\n");
+            }
+            self.last_line_count = frame_lines.items.len;
+            self.last_frame.clearRetainingCapacity();
+            try self.last_frame.appendSlice(self.allocator, next_frame.items);
+        }
+
+        fn scrollLiveRegionAway(self: *Self, writer: *std.Io.Writer, above: []const u8) !void {
+            const height: usize = @max(@as(usize, self.context.height), 1);
+            const width: usize = @max(@as(usize, self.context.width), 1);
+            try self.moveToReflowedLiveRegionTop(writer);
+            try writer.writeAll(ansi.screen_clear_below);
+            try writeAboveLines(writer, above, width);
+            var n: usize = 0;
+            while (n < height) : (n += 1) try writer.writeAll("\r\n");
+            self.bottom_anchor = true;
+            self.last_line_count = 0;
+            self.last_line_widths.clearRetainingCapacity();
+        }
+
+        fn moveToLiveRegionTop(self: *Self, writer: *std.Io.Writer) !void {
+            if (self.last_line_count > 1) {
+                const up: u16 = @intCast(@min(self.last_line_count - 1, std.math.maxInt(u16)));
+                try ansi.cursorUp(writer, up);
+            }
+            try writer.writeAll("\r");
+        }
+
+        fn moveToReflowedLiveRegionTop(self: *Self, writer: *std.Io.Writer) !void {
+            const width: usize = @max(@as(usize, self.context.width), 1);
+            const occupied = reflowedRowCount(self.last_line_widths.items, width);
+            if (occupied > 1) {
+                const up: u16 = @intCast(@min(occupied - 1, std.math.maxInt(u16)));
+                try ansi.cursorUp(writer, up);
+            }
+            try writer.writeAll("\r");
+        }
+
+        fn writeAboveLines(writer: *std.Io.Writer, above: []const u8, width: usize) !void {
+            if (above.len == 0) return;
+            const body = if (above[above.len - 1] == '\n') above[0 .. above.len - 1] else above;
+            var lines = std.mem.splitScalar(u8, body, '\n');
+            while (lines.next()) |line| {
+                try writer.writeAll(line);
+                if (visibleWidth(line) < width) try writer.writeAll(ansi.line_clear_right);
+                try writer.writeAll("\r\n");
+            }
+        }
+
+        fn finishInline(self: *Self) void {
+            if (self.terminal) |*term| {
+                const writer = term.writer();
+                writer.writeAll(ansi.sync_start) catch return;
+                self.moveToReflowedLiveRegionTop(writer) catch return;
+                writer.writeAll(ansi.screen_clear_below) catch return;
+                writeAboveLines(writer, self.context.above_buffer.items, @max(@as(usize, self.context.width), 1)) catch return;
+                self.context.above_buffer.clearRetainingCapacity();
+                self.last_line_count = 0;
+                self.last_line_widths.clearRetainingCapacity();
+                writer.writeAll(ansi.sync_end) catch return;
+                term.flush() catch return;
+            }
+        }
+
+        /// Re-establish the bottom anchor and drop the stale frame, for the
+        /// paths where another writer moved the cursor (resume after suspend).
+        fn reanchorInline(self: *Self) void {
+            self.bottom_anchor = true;
+            self.last_line_count = 0;
+            self.last_frame.clearRetainingCapacity();
+            self.last_line_widths.clearRetainingCapacity();
+            self.needs_repaint = true;
+        }
+
+        fn writeClampedLine(writer: *std.Io.Writer, line: []const u8, width: usize) !usize {
+            var i: usize = 0;
+            var used: usize = 0;
+            var clipped = false;
+            while (i < line.len) {
+                const c = line[i];
+                if (c == 0x1b) {
+                    const end = escapeSequenceEnd(line, i);
+                    try writer.writeAll(line[i..end]);
+                    i = end;
+                    continue;
+                }
+                const len = std.unicode.utf8ByteSequenceLength(c) catch 1;
+                const take = @min(len, line.len - i);
+                const codepoint: u21 = std.unicode.utf8Decode(line[i .. i + take]) catch c;
+                const cell_width = unicode.charWidth(codepoint);
+                if (clipped or used + cell_width > width) {
+                    // Past the truncation point: drop printable characters so a
+                    // wide glyph straddling the edge cannot pull later text in,
+                    // but keep emitting escape sequences (trailing resets).
+                    clipped = true;
+                    i += take;
+                    continue;
+                }
+                try writer.writeAll(line[i .. i + take]);
+                used += cell_width;
+                i += take;
+            }
+            return used;
+        }
+
+        fn countLines(text: []const u8) usize {
+            if (text.len == 0) return 1;
+            var count: usize = 1;
+            for (text) |c| {
+                if (c == '\n') count += 1;
+            }
+            return count;
         }
 
         /// Send a message to the model.
@@ -939,3 +1279,173 @@ pub fn Program(comptime Model: type) type {
         }
     };
 }
+
+fn reflowedRowCount(widths: []const usize, width: usize) usize {
+    var rows: usize = 0;
+    for (widths) |w| rows += @max(1, (w + width - 1) / width);
+    return rows;
+}
+
+test "reflowedRowCount counts rewrapped rows at a narrower width" {
+    try std.testing.expectEqual(@as(usize, 5), reflowedRowCount(&.{ 0, 100, 100, 100, 100 }, 100));
+    try std.testing.expectEqual(@as(usize, 9), reflowedRowCount(&.{ 0, 100, 100, 100, 100 }, 70));
+    try std.testing.expectEqual(@as(usize, 5), reflowedRowCount(&.{ 0, 100, 100, 100, 100 }, 120));
+    try std.testing.expectEqual(@as(usize, 9), reflowedRowCount(&.{ 100, 41, 140 }, 40));
+    try std.testing.expectEqual(@as(usize, 0), reflowedRowCount(&.{}, 40));
+}
+
+fn inkWidth(line: []const u8) usize {
+    return visibleWidth(std.mem.trimEnd(u8, line, " "));
+}
+
+test "inkWidth ignores trailing padding but keeps styled cells" {
+    try std.testing.expectEqual(@as(usize, 0), inkWidth("          "));
+    try std.testing.expectEqual(@as(usize, 5), inkWidth("hello     "));
+    try std.testing.expectEqual(@as(usize, 8), inkWidth("\x1b[44mhello   \x1b[0m"));
+}
+
+fn visibleWidth(line: []const u8) usize {
+    var i: usize = 0;
+    var used: usize = 0;
+    while (i < line.len) {
+        const c = line[i];
+        if (c == 0x1b) {
+            i = escapeSequenceEnd(line, i);
+            continue;
+        }
+        const len = std.unicode.utf8ByteSequenceLength(c) catch 1;
+        const take = @min(len, line.len - i);
+        const codepoint: u21 = std.unicode.utf8Decode(line[i .. i + take]) catch c;
+        used += unicode.charWidth(codepoint);
+        i += take;
+    }
+    return used;
+}
+
+fn escapeSequenceEnd(text: []const u8, from: usize) usize {
+    var i = from + 1;
+    if (i >= text.len) return text.len;
+    const second = text[i];
+    i += 1;
+    switch (second) {
+        '[' => {
+            while (i < text.len) : (i += 1) {
+                const c = text[i];
+                if (c >= 0x40 and c <= 0x7e) return i + 1;
+            }
+            return text.len;
+        },
+        ']', 'P', '_', '^', 'X' => {
+            while (i < text.len) : (i += 1) {
+                if (text[i] == 0x07) return i + 1;
+                if (text[i] == 0x1b and i + 1 < text.len and text[i + 1] == '\\') return i + 2;
+            }
+            return text.len;
+        },
+        '(', ')', '*', '+' => return @min(text.len, i + 1),
+        else => return i,
+    }
+}
+
+const AnchorTestModel = struct {
+    pub const Msg = union(enum) { nop: void };
+
+    pub fn init(_: *AnchorTestModel, _: *Context) Cmd(AnchorTestModel.Msg) {
+        return .none;
+    }
+
+    pub fn update(_: *AnchorTestModel, _: AnchorTestModel.Msg, _: *Context) Cmd(AnchorTestModel.Msg) {
+        return .none;
+    }
+
+    pub fn view(_: *const AnchorTestModel, _: *const Context) []const u8 {
+        return "one\ntwo";
+    }
+};
+
+test "renderInlineFrame anchors a short frame to the bottom after a scroll" {
+    var env_map: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env_map.deinit();
+
+    var program = Program(AnchorTestModel).init(std.testing.allocator, std.testing.io, &env_map);
+    defer program.deinit();
+    program.options.inline_bottom_viewport = true;
+    program.context.allocator = program.arena.allocator();
+    program.context.width = 40;
+    program.context.height = 10;
+
+    // scrollLiveRegionAway leaves the cursor on the bottom row and asks the
+    // next frame to anchor there instead of homing to the top-left.
+    program.bottom_anchor = true;
+
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try program.renderInlineFrame(&out.writer, "one\ntwo", "");
+
+    // A two-row frame at height 10 must move up 1 from the bottom row, not home.
+    try std.testing.expect(std.mem.startsWith(u8, out.written(), "\r\x1b[1A"));
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\x1b[H") == null);
+    try std.testing.expectEqual(false, program.bottom_anchor);
+}
+
+test "scrollLiveRegionAway leaves the cursor at the bottom row" {
+    var env_map: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env_map.deinit();
+
+    var program = Program(AnchorTestModel).init(std.testing.allocator, std.testing.io, &env_map);
+    defer program.deinit();
+    program.options.inline_bottom_viewport = true;
+    program.context.allocator = program.arena.allocator();
+    program.context.width = 40;
+    program.context.height = 10;
+
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try program.scrollLiveRegionAway(&out.writer, "");
+
+    // One line feed per screen row, no cursor-home, and the next frame anchors.
+    try std.testing.expectEqual(@as(usize, 10), std.mem.count(u8, out.written(), "\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\x1b[H") == null);
+    try std.testing.expectEqual(true, program.bottom_anchor);
+}
+
+test "writeClampedLine stops at a wide character that crosses the edge" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    const used = try Program(AnchorTestModel).writeClampedLine(&out.writer, "123456789漢ab", 10);
+
+    // The wide glyph does not fit the last cell, so truncation stops before it
+    // and the trailing 'a' from beyond the boundary is not pulled in.
+    try std.testing.expectEqualStrings("123456789", out.written());
+    try std.testing.expectEqual(@as(usize, 9), used);
+}
+
+test "writeClampedLine still flushes escape sequences past the edge" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    _ = try Program(AnchorTestModel).writeClampedLine(&out.writer, "123456789漢\x1b[0m", 10);
+
+    // The reset after the truncation point is still written.
+    try std.testing.expectEqualStrings("123456789\x1b[0m", out.written());
+}
+
+test "reanchorInline drops the stale frame and re-anchors at the bottom" {
+    var env_map: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env_map.deinit();
+
+    var program = Program(AnchorTestModel).init(std.testing.allocator, std.testing.io, &env_map);
+    defer program.deinit();
+    program.context.allocator = program.arena.allocator();
+    program.last_line_count = 7;
+    try program.last_frame.appendSlice(program.allocator, "stale");
+    try program.last_line_widths.append(program.allocator, 5);
+
+    program.reanchorInline();
+
+    try std.testing.expectEqual(true, program.bottom_anchor);
+    try std.testing.expectEqual(@as(usize, 0), program.last_line_count);
+    try std.testing.expectEqual(@as(usize, 0), program.last_frame.items.len);
+    try std.testing.expectEqual(@as(usize, 0), program.last_line_widths.items.len);
+    try std.testing.expectEqual(true, program.needs_repaint);
+}
+

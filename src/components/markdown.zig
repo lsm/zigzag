@@ -6,6 +6,7 @@ const Writer = std.Io.Writer;
 const style_mod = @import("../style/style.zig");
 const Color = @import("../style/color.zig").Color;
 const border_mod = @import("../style/border.zig");
+const unicode = @import("../unicode.zig");
 
 pub const Markdown = struct {
     // Styling
@@ -138,31 +139,40 @@ pub const Markdown = struct {
 
         var lines_iter = std.mem.splitScalar(u8, source, '\n');
         var in_code_block = false;
+        var code_fence_len: usize = 0;
         var first_line = true;
 
         while (lines_iter.next()) |line| {
             if (!first_line) try writer.writeByte('\n');
             first_line = false;
 
-            // Code block toggle
-            if (std.mem.startsWith(u8, std.mem.trimStart(u8, line, " "), "```")) {
+            // Code block toggle. Track the opener length so a four-backtick
+            // block can safely contain literal triple-backtick examples without
+            // prematurely closing the displayed block.
+            const trimmed_for_fence = std.mem.trimStart(u8, line, " ");
+            const fence_len = countLeadingChar(trimmed_for_fence, '`');
+            if (fence_len >= 3 and (!in_code_block or isCodeFenceClose(trimmed_for_fence, code_fence_len))) {
                 in_code_block = !in_code_block;
                 if (in_code_block) {
+                    code_fence_len = fence_len;
                     // Opening fence
                     const bar = try self.code_block_border.render(tmp, "┌");
                     try writer.writeAll(bar);
                     const dash = try self.code_block_border.render(tmp, "─");
-                    for (0..@min(self.width - 2, 40)) |_| {
+                    const block_width = self.codeBlockWidth();
+                    for (0..block_width - 2) |_| {
                         try writer.writeAll(dash);
                     }
                     const end = try self.code_block_border.render(tmp, "┐");
                     try writer.writeAll(end);
                 } else {
+                    code_fence_len = 0;
                     // Closing fence
                     const bar = try self.code_block_border.render(tmp, "└");
                     try writer.writeAll(bar);
                     const dash = try self.code_block_border.render(tmp, "─");
-                    for (0..@min(self.width - 2, 40)) |_| {
+                    const block_width = self.codeBlockWidth();
+                    for (0..block_width - 2) |_| {
                         try writer.writeAll(dash);
                     }
                     const end = try self.code_block_border.render(tmp, "┘");
@@ -172,10 +182,17 @@ pub const Markdown = struct {
             }
 
             if (in_code_block) {
-                const bar = try self.code_block_border.render(tmp, "│ ");
-                try writer.writeAll(bar);
-                const styled = try self.code_block_style.render(tmp, line);
+                const block_width = self.codeBlockWidth();
+                const inner_width = block_width - 4; // border + side padding
+                const visible_len = clampToCells(line, inner_width);
+                const clipped = line[0..visible_len];
+                const start_bar = try self.code_block_border.render(tmp, "│ ");
+                try writer.writeAll(start_bar);
+                const styled = try self.code_block_style.render(tmp, clipped);
                 try writer.writeAll(styled);
+                for (displayWidth(clipped)..inner_width) |_| try writer.writeByte(' ');
+                const end_bar = try self.code_block_border.render(tmp, " │");
+                try writer.writeAll(end_bar);
                 continue;
             }
 
@@ -341,10 +358,136 @@ pub const Markdown = struct {
         return result.toOwnedSlice();
     }
 
+    fn codeBlockWidth(self: *const Markdown) usize {
+        return @max(@as(usize, self.width), 8);
+    }
+
+    fn displayWidth(text: []const u8) usize {
+        var i: usize = 0;
+        var cells: usize = 0;
+        while (i < text.len) {
+            const len = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
+            const take = @min(len, text.len - i);
+            const codepoint: u21 = std.unicode.utf8Decode(text[i .. i + take]) catch text[i];
+            cells += unicode.charWidth(codepoint);
+            i += take;
+        }
+        return cells;
+    }
+
+    fn clampToCells(text: []const u8, max_cells: usize) usize {
+        var i: usize = 0;
+        var cells: usize = 0;
+        while (i < text.len) {
+            const len = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
+            const take = @min(len, text.len - i);
+            const codepoint: u21 = std.unicode.utf8Decode(text[i .. i + take]) catch text[i];
+            const width = unicode.charWidth(codepoint);
+            if (cells + width > max_cells) break;
+            cells += width;
+            i += take;
+        }
+        return i;
+    }
+
     fn isAllChar(s: []const u8, c: u8) bool {
         for (s) |ch| {
             if (ch != c and ch != ' ') return false;
         }
         return true;
     }
+
+    fn countLeadingChar(s: []const u8, c: u8) usize {
+        var n: usize = 0;
+        while (n < s.len and s[n] == c) n += 1;
+        return n;
+    }
+
+    fn isCodeFenceClose(trimmed: []const u8, opener_len: usize) bool {
+        if (countLeadingChar(trimmed, '`') < opener_len) return false;
+        for (trimmed) |c| {
+            if (c != '`' and c != ' ' and c != '\t' and c != '\r') return false;
+        }
+        return true;
+    }
 };
+
+test "markdown renderer respects long backtick fence length" {
+    const src = "````text\n```mermaid\nflowchart TD\n```\n````";
+    var md = Markdown.init();
+    const out = try md.render(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+
+    // One outer opener and one outer closer; inner triple-backtick lines should
+    // render as code content, not toggle the code-block state.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "┌"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "└"));
+    try std.testing.expect(std.mem.indexOf(u8, out, "```mermaid") != null);
+}
+
+test "markdown code block clamps wide characters on a cell boundary" {
+    const cjk = "漢" ** 40;
+    const src = "```\n" ++ cjk ++ "\n```";
+    var md = Markdown.init();
+    const out = try md.render(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+
+    // A byte clamp would cut the 26th wide character in half, leaving invalid
+    // UTF-8 in the styled output.
+    try std.testing.expect(std.unicode.utf8ValidateSlice(out));
+    // inner width 76 cells holds 38 wide characters exactly.
+    try std.testing.expectEqual(@as(usize, 38), std.mem.count(u8, out, "漢"));
+}
+
+test "markdown code block does not split an emoji" {
+    const emoji = "😀" ** 40;
+    const src = "```\n" ++ emoji ++ "\n```";
+    var md = Markdown.init();
+    const out = try md.render(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+
+    // A byte clamp would cut a four-byte codepoint in half.
+    try std.testing.expect(std.unicode.utf8ValidateSlice(out));
+}
+
+test "markdown code block pads wide characters by display cells" {
+    const cjk = "漢" ** 40;
+    const src = "```\n" ++ cjk ++ "\n```";
+    var md = Markdown.init();
+    const out = try md.render(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+
+    // block width 80, inner width 76 cells: the widest row is 38 wide
+    // characters (76 cells) plus the two border columns.
+    var widest: usize = 0;
+    var lines = std.mem.splitScalar(u8, out, '\n');
+    while (lines.next()) |line| {
+        const cells = strippedDisplayWidth(line);
+        if (cells > widest) widest = cells;
+    }
+    try std.testing.expectEqual(@as(usize, 80), widest);
+}
+
+fn strippedDisplayWidth(text: []const u8) usize {
+    var i: usize = 0;
+    var cells: usize = 0;
+    while (i < text.len) {
+        if (text[i] == 0x1b) {
+            i += 1;
+            if (i < text.len and text[i] == '[') {
+                i += 1;
+                while (i < text.len and !(text[i] >= 0x40 and text[i] <= 0x7e)) i += 1;
+                if (i < text.len) i += 1;
+                continue;
+            }
+            if (i < text.len) i += 1;
+            continue;
+        }
+        const len = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
+        const take = @min(len, text.len - i);
+        const codepoint: u21 = std.unicode.utf8Decode(text[i .. i + take]) catch text[i];
+        cells += unicode.charWidth(codepoint);
+        i += take;
+    }
+    return cells;
+}

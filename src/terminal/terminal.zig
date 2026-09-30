@@ -17,6 +17,11 @@ else if (builtin.os.tag == .windows)
     @import("platform/windows.zig")
 else
     @import("platform/posix.zig");
+const mouse = @import("../input/mouse.zig");
+
+/// Every mouse-tracking mode this framework has enabled, disabled in one write.
+/// Setup sends it to clear modes a crashed previous run may have left on.
+pub const input_mode_reset = "\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
 
 pub const Size = platform.Size;
 pub const TerminalError = platform.TerminalError;
@@ -247,6 +252,10 @@ pub const Config = struct {
     hide_cursor: bool = true,
     /// Enable mouse tracking
     mouse: bool = false,
+    /// Enable wheel scrolling in the alternate screen without mouse tracking.
+    alternate_scroll: bool = false,
+    /// Clear the full screen during setup.
+    clear_on_setup: bool = true,
     /// Enable bracketed paste mode
     bracketed_paste: bool = true,
     /// Custom input file (default: stdin)
@@ -305,7 +314,10 @@ pub const Terminal = struct {
             };
         };
 
-        try term.setup();
+        term.setup() catch |err| {
+            term.cleanup();
+            return err;
+        };
         return term;
     }
 
@@ -320,6 +332,18 @@ pub const Terminal = struct {
         // Enable raw mode
         try platform.enableRawMode(&self.state);
 
+        // Clear terminal modes that can survive a crashed previous run. This is
+        // especially important for Kitty keyboard protocol: if left enabled,
+        // Ctrl+C reaches the user's shell as CSI bytes like `99;5u`.
+        try self.writeBytes(ansi.kitty_keyboard_disable_all);
+        try self.writeBytes(ansi.kitty_keyboard_reset);
+        try self.writeBytes(ansi.bracketed_paste_disable);
+        try self.writeBytes("\x1b[?1007l");
+        // Clear every mouse-tracking mode the framework has ever enabled, not
+        // just the one it enables now, so a crashed older run cannot leave
+        // motion reporting on.
+        try self.writeBytes(input_mode_reset);
+
         // Enter alternate screen
         if (self.config.alt_screen) {
             try self.writeBytes(ansi.alt_screen_enter);
@@ -331,10 +355,20 @@ pub const Terminal = struct {
             try self.writeBytes(ansi.cursor_hide);
         }
 
-        // Enable mouse
+        // Enable normal mouse tracking (button/wheel only) with SGR encoding.
+        // This can capture plain clicks in many terminals, so apps that need
+        // native drag selection should prefer alternate_scroll below.
         if (self.config.mouse) {
-            try self.writeBytes("\x1b[?1003h\x1b[?1006h");
+            try self.writeBytes(mouse.enableSequence(.normal));
             self.state.mouse_enabled = true;
+        }
+
+        // In xterm-compatible terminals, alternate-scroll converts wheel
+        // input in the alternate screen into cursor up/down key events. This
+        // preserves native drag selection because mouse buttons are not
+        // reported to the application.
+        if (self.config.alternate_scroll) {
+            try self.writeBytes("\x1b[?1007h");
         }
 
         // Enable bracketed paste
@@ -351,8 +385,10 @@ pub const Terminal = struct {
         self.detectImageCapabilities();
 
         // Clear screen
-        try self.writeBytes(ansi.screen_clear);
-        try self.writeBytes(ansi.cursor_home);
+        if (self.config.clear_on_setup) {
+            try self.writeBytes(ansi.screen_clear);
+            try self.writeBytes(ansi.cursor_home);
+        }
 
         try self.flush();
     }
@@ -360,7 +396,9 @@ pub const Terminal = struct {
     pub fn cleanup(self: *Terminal) void {
         // Disable Kitty keyboard protocol
         if (self.config.kitty_keyboard) {
+            self.writeBytes(ansi.kitty_keyboard_disable_all) catch {};
             self.writeBytes(ansi.kitty_keyboard_disable) catch {};
+            self.writeBytes(ansi.kitty_keyboard_reset) catch {};
         }
 
         if (self.unicode_width_caps.mode_2027) {
@@ -375,8 +413,12 @@ pub const Terminal = struct {
 
         // Disable mouse
         if (self.state.mouse_enabled) {
-            self.writeBytes("\x1b[?1006l\x1b[?1003l") catch {};
+            self.writeBytes(mouse.disableSequence(.normal)) catch {};
             self.state.mouse_enabled = false;
+        }
+
+        if (self.config.alternate_scroll) {
+            self.writeBytes("\x1b[?1007l") catch {};
         }
 
         // Show cursor
@@ -471,13 +513,13 @@ pub const Terminal = struct {
 
     /// Enable mouse tracking
     pub fn enableMouse(self: *Terminal) !void {
-        try self.writeBytes("\x1b[?1003h\x1b[?1006h");
+        try self.writeBytes(mouse.enableSequence(.normal));
         self.state.mouse_enabled = true;
     }
 
     /// Disable mouse tracking
     pub fn disableMouse(self: *Terminal) !void {
-        try self.writeBytes("\x1b[?1006l\x1b[?1003l");
+        try self.writeBytes(mouse.disableSequence(.normal));
         self.state.mouse_enabled = false;
     }
 
@@ -1869,4 +1911,11 @@ test "parseOsc52Response tmux passthrough ST" {
     try std.testing.expectEqual(@as(usize, 0), parsed.consume_start);
     try std.testing.expectEqual(bytes.len, parsed.consume_end);
     try std.testing.expectEqualStrings("YQ==", parsed.payload_b64);
+}
+
+test "input_mode_reset clears every mouse-tracking mode the framework enabled" {
+    try std.testing.expect(std.mem.indexOf(u8, input_mode_reset, "?1000l") != null);
+    try std.testing.expect(std.mem.indexOf(u8, input_mode_reset, "?1002l") != null);
+    try std.testing.expect(std.mem.indexOf(u8, input_mode_reset, "?1003l") != null);
+    try std.testing.expect(std.mem.indexOf(u8, input_mode_reset, "?1006l") != null);
 }

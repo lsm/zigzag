@@ -86,6 +86,12 @@ pub fn disableSequence(mode: TrackingMode) []const u8 {
     };
 }
 
+test "normal mouse tracking preserves terminal drag selection mode" {
+    try std.testing.expectEqualStrings("\x1b[?1000h\x1b[?1006h", enableSequence(.normal));
+    try std.testing.expectEqualStrings("\x1b[?1006l\x1b[?1000l", disableSequence(.normal));
+    try std.testing.expect(std.mem.indexOf(u8, enableSequence(.normal), "?1003h") == null);
+}
+
 /// Parse SGR mouse event (\x1b[<...M or \x1b[<...m)
 pub fn parseSgr(data: []const u8) ?struct { event: MouseEvent, consumed: usize } {
     // Format: \x1b[<Cb;Cx;CyM or \x1b[<Cb;Cx;Cym
