@@ -74,6 +74,7 @@ pub fn Program(comptime Model: type) type {
         last_line_count: usize,
         needs_repaint: bool,
         resize_deadline: ?u64,
+        bottom_anchor: bool,
         last_line_widths: std.ArrayList(usize),
         last_frame: std.ArrayList(u8),
         relayout_above_split: ?usize,
@@ -178,6 +179,7 @@ pub fn Program(comptime Model: type) type {
                 .last_line_count = 0,
                 .needs_repaint = false,
                 .resize_deadline = null,
+                .bottom_anchor = false,
                 .last_line_widths = .empty,
                 .last_frame = .empty,
                 .relayout_above_split = null,
@@ -1077,8 +1079,6 @@ pub fn Program(comptime Model: type) type {
         fn renderInlineFrame(self: *Self, writer: *std.Io.Writer, view_output: []const u8, above: []const u8) !void {
             const height: usize = @max(@as(usize, self.context.height), 1);
             const width: usize = @max(@as(usize, self.context.width), 1);
-            try self.moveToLiveRegionTop(writer);
-            try writeAboveLines(writer, above, width);
 
             var frame_lines: std.ArrayList([]const u8) = .empty;
             defer frame_lines.deinit(self.allocator);
@@ -1091,6 +1091,21 @@ pub fn Program(comptime Model: type) type {
                 }
                 try frame_lines.append(self.allocator, line);
             }
+
+            if (self.bottom_anchor) {
+                // The cursor rests on the bottom row (scrollLiveRegionAway left
+                // it there), so anchor the frame's last row to that row instead
+                // of homing it to the top-left.
+                self.bottom_anchor = false;
+                try writer.writeAll("\r");
+                if (frame_lines.items.len > 1) {
+                    const up: u16 = @intCast(@min(frame_lines.items.len - 1, std.math.maxInt(u16)));
+                    try ansi.cursorUp(writer, up);
+                }
+            } else {
+                try self.moveToLiveRegionTop(writer);
+            }
+            try writeAboveLines(writer, above, width);
 
             const reuse = above.len == 0 and self.last_line_count > 0;
             var old_lines = std.mem.splitScalar(u8, self.last_frame.items, '\n');
@@ -1129,7 +1144,7 @@ pub fn Program(comptime Model: type) type {
             try writeAboveLines(writer, above, width);
             var n: usize = 0;
             while (n < height) : (n += 1) try writer.writeAll("\r\n");
-            try writer.writeAll(ansi.cursor_home);
+            self.bottom_anchor = true;
             self.last_line_count = 0;
             self.last_line_widths.clearRetainingCapacity();
         }
@@ -1301,3 +1316,66 @@ fn escapeSequenceEnd(text: []const u8, from: usize) usize {
         else => return i,
     }
 }
+
+const AnchorTestModel = struct {
+    pub const Msg = union(enum) { nop: void };
+
+    pub fn init(_: *AnchorTestModel, _: *Context) Cmd(AnchorTestModel.Msg) {
+        return .none;
+    }
+
+    pub fn update(_: *AnchorTestModel, _: AnchorTestModel.Msg, _: *Context) Cmd(AnchorTestModel.Msg) {
+        return .none;
+    }
+
+    pub fn view(_: *const AnchorTestModel, _: *const Context) []const u8 {
+        return "one\ntwo";
+    }
+};
+
+test "renderInlineFrame anchors a short frame to the bottom after a scroll" {
+    var env_map: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env_map.deinit();
+
+    var program = Program(AnchorTestModel).init(std.testing.allocator, std.testing.io, &env_map);
+    defer program.deinit();
+    program.options.inline_bottom_viewport = true;
+    program.context.allocator = program.arena.allocator();
+    program.context.width = 40;
+    program.context.height = 10;
+
+    // scrollLiveRegionAway leaves the cursor on the bottom row and asks the
+    // next frame to anchor there instead of homing to the top-left.
+    program.bottom_anchor = true;
+
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try program.renderInlineFrame(&out.writer, "one\ntwo", "");
+
+    // A two-row frame at height 10 must move up 1 from the bottom row, not home.
+    try std.testing.expect(std.mem.startsWith(u8, out.written(), "\r\x1b[1A"));
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\x1b[H") == null);
+    try std.testing.expectEqual(false, program.bottom_anchor);
+}
+
+test "scrollLiveRegionAway leaves the cursor at the bottom row" {
+    var env_map: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env_map.deinit();
+
+    var program = Program(AnchorTestModel).init(std.testing.allocator, std.testing.io, &env_map);
+    defer program.deinit();
+    program.options.inline_bottom_viewport = true;
+    program.context.allocator = program.arena.allocator();
+    program.context.width = 40;
+    program.context.height = 10;
+
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try program.scrollLiveRegionAway(&out.writer, "");
+
+    // One line feed per screen row, no cursor-home, and the next frame anchors.
+    try std.testing.expectEqual(@as(usize, 10), std.mem.count(u8, out.written(), "\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\x1b[H") == null);
+    try std.testing.expectEqual(true, program.bottom_anchor);
+}
+
