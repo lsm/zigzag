@@ -642,6 +642,21 @@ pub fn Program(comptime Model: type) type {
                 term.setup() catch {};
             }
 
+            // The shell wrote its prompt and `fg` output while we were stopped,
+            // so the cursor no longer marks the live region. Scroll to a known
+            // row and re-anchor the next frame there; forget the old frame so
+            // the reuse path cannot skip rows the shell overwrote.
+            if (self.options.inline_bottom_viewport) {
+                if (self.terminal) |*term| {
+                    const writer = term.writer();
+                    const height: usize = @max(@as(usize, self.context.height), 1);
+                    var n: usize = 0;
+                    while (n < height) : (n += 1) writer.writeAll("\r\n") catch break;
+                    term.flush() catch {};
+                }
+                self.reanchorInline();
+            }
+
             // Avoid a large post-resume frame delta, and rebase the pacing anchor
             // so we don't burst-render to "catch up" the suspended interval.
             self.last_frame_time = self.elapsedNs();
@@ -1193,6 +1208,16 @@ pub fn Program(comptime Model: type) type {
             }
         }
 
+        /// Re-establish the bottom anchor and drop the stale frame, for the
+        /// paths where another writer moved the cursor (resume after suspend).
+        fn reanchorInline(self: *Self) void {
+            self.bottom_anchor = true;
+            self.last_line_count = 0;
+            self.last_frame.clearRetainingCapacity();
+            self.last_line_widths.clearRetainingCapacity();
+            self.needs_repaint = true;
+        }
+
         fn writeClampedLine(writer: *std.Io.Writer, line: []const u8, width: usize) !usize {
             var i: usize = 0;
             var used: usize = 0;
@@ -1402,5 +1427,25 @@ test "writeClampedLine still flushes escape sequences past the edge" {
 
     // The reset after the truncation point is still written.
     try std.testing.expectEqualStrings("123456789\x1b[0m", out.written());
+}
+
+test "reanchorInline drops the stale frame and re-anchors at the bottom" {
+    var env_map: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env_map.deinit();
+
+    var program = Program(AnchorTestModel).init(std.testing.allocator, std.testing.io, &env_map);
+    defer program.deinit();
+    program.context.allocator = program.arena.allocator();
+    program.last_line_count = 7;
+    try program.last_frame.appendSlice(program.allocator, "stale");
+    try program.last_line_widths.append(program.allocator, 5);
+
+    program.reanchorInline();
+
+    try std.testing.expectEqual(true, program.bottom_anchor);
+    try std.testing.expectEqual(@as(usize, 0), program.last_line_count);
+    try std.testing.expectEqual(@as(usize, 0), program.last_frame.items.len);
+    try std.testing.expectEqual(@as(usize, 0), program.last_line_widths.items.len);
+    try std.testing.expectEqual(true, program.needs_repaint);
 }
 
