@@ -1382,6 +1382,7 @@ test "dispatchInputEvents stops at the quit and hands nothing after it to the mo
 
     var program = Program(QuitTestModel).init(std.testing.allocator, std.testing.io, &env_map);
     defer program.deinit();
+    program.model = .{};
     program.running.store(true, .release);
 
     const events = [_]keyboard.ParseResult{
