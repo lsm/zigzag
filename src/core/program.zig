@@ -360,6 +360,7 @@ pub fn Program(comptime Model: type) type {
 
             // Non-blocking drain; input typed during pacing sits in the TTY buffer.
             try self.drainInput();
+            if (!self.isRunning()) return;
 
             // Handle pending tick
             if (self.pending_tick) |tick_ns| {
