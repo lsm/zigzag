@@ -1,6 +1,5 @@
 //! Program runtime for the ZigZag TUI framework.
 //! Implements the Model-Update-View pattern with an event loop.
-
 const std = @import("std");
 const builtin = @import("builtin");
 const Terminal = @import("../terminal/terminal.zig").Terminal;
@@ -73,6 +72,11 @@ pub fn Program(comptime Model: type) type {
         last_every_tick: u64,
         last_view_hash: u64,
         last_line_count: usize,
+        needs_repaint: bool,
+        resize_deadline: ?u64,
+        last_line_widths: std.ArrayList(usize),
+        last_frame: std.ArrayList(u8),
+        relayout_above_split: ?usize,
         pending_image: ?PendingImage,
         logger: ?Logger,
         paste_buffer: std.array_list.Managed(u8),
@@ -172,6 +176,11 @@ pub fn Program(comptime Model: type) type {
                 .last_every_tick = 0,
                 .last_view_hash = 0,
                 .last_line_count = 0,
+                .needs_repaint = false,
+                .resize_deadline = null,
+                .last_line_widths = .empty,
+                .last_frame = .empty,
+                .relayout_above_split = null,
                 .pending_image = null,
                 .logger = null,
                 .paste_buffer = std.array_list.Managed(u8).init(allocator),
@@ -196,6 +205,9 @@ pub fn Program(comptime Model: type) type {
             if (self.logger) |*l| {
                 l.deinit();
             }
+            self.context.deinit();
+            self.last_line_widths.deinit(self.allocator);
+            self.last_frame.deinit(self.allocator);
             self.message_queue.deinit();
             self.paste_buffer.deinit();
             self.paste_pending_prefix.deinit();
@@ -222,6 +234,8 @@ pub fn Program(comptime Model: type) type {
             while (self.running.load(.acquire)) {
                 try self.tick();
             }
+
+            if (self.options.inline_bottom_viewport) self.finishInline();
         }
 
         /// Initialize the terminal and model without entering the event loop.
@@ -321,15 +335,21 @@ pub fn Program(comptime Model: type) type {
                 const size = try self.terminal.?.getSize();
                 self.context.width = size.cols;
                 self.context.height = size.rows;
-
-                // Only send window_size message if the user model supports it
-                if (@hasField(UserMsg, "window_size")) {
-                    const cmd = self.dispatchToModel(.{ .window_size = .{
-                        .width = size.cols,
-                        .height = size.rows,
-                    } });
-                    try self.processCommand(cmd);
-                    if (!self.isRunning()) return;
+                self.resize_deadline = self.context.elapsed + resize_debounce_ns;
+            }
+            if (self.resize_deadline) |deadline| {
+                if (self.context.elapsed >= deadline) {
+                    self.resize_deadline = null;
+                    self.needs_repaint = true;
+                    if (self.options.inline_bottom_viewport) self.relayout_above_split = self.context.above_buffer.items.len;
+                    if (@hasField(UserMsg, "window_size")) {
+                        const cmd = self.dispatchToModel(.{ .window_size = .{
+                            .width = self.context.width,
+                            .height = self.context.height,
+                        } });
+                        try self.processCommand(cmd);
+                        if (!self.isRunning()) return;
+                    }
                 }
             }
 
@@ -426,113 +446,6 @@ pub fn Program(comptime Model: type) type {
                     try self.message_queue.requeueFront(batch.items[i + 1 ..]);
                     return err;
                 };
-            }
-        }
-
-        /// Dispatch a message to the model, applying the filter if set
-        fn dispatchToModel(self: *Self, user_msg: UserMsg) UserCmd {
-            if (self.filter) |f| {
-                if (f(user_msg)) |filtered_msg| {
-                    return self.model.update(filtered_msg, &self.context);
-                }
-                return .none;
-            }
-            return self.model.update(user_msg, &self.context);
-        }
-
-        fn processKeyEvent(self: *Self, key: keyboard.KeyEvent) ?UserCmd {
-            // Check for Ctrl+C to quit
-            if (key.modifiers.ctrl) {
-                switch (key.key) {
-                    .char => |c| {
-                        if (c == 'c') {
-                            return .quit;
-                        }
-                        // Handle Ctrl+Z for suspend
-                        if (c == 'z' and self.options.suspend_enabled) {
-                            self.performSuspend();
-                            return null;
-                        }
-                    },
-                    else => {},
-                }
-            }
-
-            // Handle paste events
-            if (key.key == .paste) {
-                if (@hasField(UserMsg, "paste")) {
-                    const user_msg = UserMsg{ .paste = key.key.paste };
-                    return self.dispatchToModel(user_msg);
-                }
-                // If model doesn't handle paste, send as individual key events
-                if (@hasField(UserMsg, "key")) {
-                    const user_msg = UserMsg{ .key = key };
-                    return self.dispatchToModel(user_msg);
-                }
-                return null;
-            }
-
-            // Convert to user message if Model.Msg has a key variant
-            if (@hasField(UserMsg, "key")) {
-                const user_msg = UserMsg{ .key = key };
-                return self.dispatchToModel(user_msg);
-            }
-
-            return null;
-        }
-
-        fn resolveUnicodeWidthStrategy(self: *const Self, detected: unicode.WidthStrategy) unicode.WidthStrategy {
-            if (self.options.unicode_width_strategy) |forced| {
-                return forced;
-            }
-            if (self.environment.unicode_width_override) |from_env| {
-                return from_env;
-            }
-            return detected;
-        }
-
-        fn processMouseEvent(self: *Self, mouse_event: keyboard.MouseEvent) ?UserCmd {
-            if (@hasField(UserMsg, "mouse")) {
-                const user_msg = UserMsg{ .mouse = mouse_event };
-                return self.dispatchToModel(user_msg);
-            }
-
-            return null;
-        }
-
-        /// Perform suspend (Ctrl+Z) — POSIX only
-        fn performSuspend(self: *Self) void {
-            if (builtin.os.tag == .windows) return;
-
-            // Cleanup terminal
-            if (self.terminal) |*term| {
-                term.cleanup();
-            }
-
-            // Raise SIGTSTP to suspend process
-            if (builtin.os.tag != .windows) {
-                const posix = std.posix;
-                _ = posix.raise(posix.SIG.TSTP) catch {};
-            }
-
-            // When we resume (after `fg`), re-setup terminal
-            if (self.terminal) |*term| {
-                term.setup() catch {};
-            }
-
-            // Avoid a large post-resume frame delta, and rebase the pacing anchor
-            // so we don't burst-render to "catch up" the suspended interval.
-            self.last_frame_time = self.elapsedNs();
-            self.pacing_epoch = std.Io.Clock.Timestamp.now(self.io, .boot);
-            self.pacing_frame_offset = self.context.frame;
-
-            // Force re-render
-            self.last_view_hash = 0;
-
-            // Dispatch resumed message if model supports it
-            if (@hasField(UserMsg, "resumed")) {
-                const cmd = self.dispatchToModel(.{ .resumed = {} });
-                self.processCommand(cmd) catch {};
             }
         }
 
@@ -634,6 +547,113 @@ pub fn Program(comptime Model: type) type {
                 if (std.mem.eql(u8, data[data.len - len ..], delimiter[0..len])) return len;
             }
             return 0;
+        }
+
+        /// Dispatch a message to the model, applying the filter if set
+        fn dispatchToModel(self: *Self, user_msg: UserMsg) UserCmd {
+            if (self.filter) |f| {
+                if (f(user_msg)) |filtered_msg| {
+                    return self.model.update(filtered_msg, &self.context);
+                }
+                return .none;
+            }
+            return self.model.update(user_msg, &self.context);
+        }
+
+        fn processKeyEvent(self: *Self, key: keyboard.KeyEvent) ?UserCmd {
+            // Check for Ctrl+C to quit
+            if (key.modifiers.ctrl) {
+                switch (key.key) {
+                    .char => |c| {
+                        if (c == 'c' and self.options.ctrl_c_quits) {
+                            return .quit;
+                        }
+                        // Handle Ctrl+Z for suspend
+                        if (c == 'z' and self.options.suspend_enabled) {
+                            self.performSuspend();
+                            return null;
+                        }
+                    },
+                    else => {},
+                }
+            }
+
+            // Handle paste events
+            if (key.key == .paste) {
+                if (@hasField(UserMsg, "paste")) {
+                    const user_msg = UserMsg{ .paste = key.key.paste };
+                    return self.dispatchToModel(user_msg);
+                }
+                // If model doesn't handle paste, send as individual key events
+                if (@hasField(UserMsg, "key")) {
+                    const user_msg = UserMsg{ .key = key };
+                    return self.dispatchToModel(user_msg);
+                }
+                return null;
+            }
+
+            // Convert to user message if Model.Msg has a key variant
+            if (@hasField(UserMsg, "key")) {
+                const user_msg = UserMsg{ .key = key };
+                return self.dispatchToModel(user_msg);
+            }
+
+            return null;
+        }
+
+        fn resolveUnicodeWidthStrategy(self: *const Self, detected: unicode.WidthStrategy) unicode.WidthStrategy {
+            if (self.options.unicode_width_strategy) |forced| {
+                return forced;
+            }
+            if (self.environment.unicode_width_override) |from_env| {
+                return from_env;
+            }
+            return detected;
+        }
+
+        fn processMouseEvent(self: *Self, mouse_event: keyboard.MouseEvent) ?UserCmd {
+            if (@hasField(UserMsg, "mouse")) {
+                const user_msg = UserMsg{ .mouse = mouse_event };
+                return self.dispatchToModel(user_msg);
+            }
+
+            return null;
+        }
+
+        /// Perform suspend (Ctrl+Z) — POSIX only
+        fn performSuspend(self: *Self) void {
+            if (builtin.os.tag == .windows) return;
+
+            // Cleanup terminal
+            if (self.terminal) |*term| {
+                term.cleanup();
+            }
+
+            // Raise SIGTSTP to suspend process
+            if (builtin.os.tag != .windows) {
+                const posix = std.posix;
+                _ = posix.raise(posix.SIG.TSTP) catch {};
+            }
+
+            // When we resume (after `fg`), re-setup terminal
+            if (self.terminal) |*term| {
+                term.setup() catch {};
+            }
+
+            // Avoid a large post-resume frame delta, and rebase the pacing anchor
+            // so we don't burst-render to "catch up" the suspended interval.
+            self.last_frame_time = self.elapsedNs();
+            self.pacing_epoch = std.Io.Clock.Timestamp.now(self.io, .boot);
+            self.pacing_frame_offset = self.context.frame;
+
+            // Force re-render
+            self.last_view_hash = 0;
+
+            // Dispatch resumed message if model supports it
+            if (@hasField(UserMsg, "resumed")) {
+                const cmd = self.dispatchToModel(.{ .resumed = {} });
+                self.processCommand(cmd) catch {};
+            }
         }
 
         fn processCommand(self: *Self, cmd: UserCmd) !void {
@@ -989,38 +1009,41 @@ pub fn Program(comptime Model: type) type {
             self.context.allocator = self.arena.allocator();
         }
 
+        const resize_debounce_ns: u64 = 150 * std.time.ns_per_ms;
+
         fn render(self: *Self) !void {
+            if (self.resize_deadline != null) return;
             const view_output = self.model.view(&self.context);
 
             // Compute hash of view output
             const view_hash = std.hash.Wyhash.hash(0, view_output);
+            const has_above = self.context.hasPendingAbove();
+            if (view_hash == self.last_view_hash and !has_above and !self.needs_repaint and !self.context.clear_screen_requested) return;
 
-            // Only redraw if view changed
-            if (view_hash != self.last_view_hash) {
-                const writer = self.terminal.?.writer();
+            const writer = self.terminal.?.writer();
+            // Start synchronized output (prevents tearing on supporting terminals)
+            try writer.writeAll(ansi.sync_start);
+            if (self.context.clear_screen_requested) {
+                self.context.clear_screen_requested = false;
+                try writer.writeAll(ansi.screen_clear);
+                try writer.writeAll(ansi.CSI ++ "3J");
+                try writer.writeAll(ansi.cursor_home);
+                self.last_line_count = 0;
+                self.last_line_widths.clearRetainingCapacity();
+            }
 
-                // Start synchronized output (prevents tearing on supporting terminals)
-                try writer.writeAll(ansi.sync_start);
-
-                const view_line_count = countLines(view_output);
-                const render_line_capacity = if (self.options.inline_bottom_viewport)
-                    @max(view_line_count, self.last_line_count)
-                else
-                    view_line_count;
-
-                if (self.options.inline_bottom_viewport) {
-                    const clamped_capacity = @min(render_line_capacity, @as(usize, self.context.height));
-                    const start_row: u16 = if (clamped_capacity >= self.context.height)
-                        1
-                    else
-                        self.context.height - @as(u16, @intCast(clamped_capacity)) + 1;
-                    try ansi.cursorTo(writer, start_row, 1);
-                } else {
-                    // Move cursor home (don't clear entire screen to reduce flicker)
-                    try writer.writeAll(ansi.cursor_home);
+            if (self.options.inline_bottom_viewport) {
+                var above: []const u8 = self.context.above_buffer.items;
+                if (self.relayout_above_split) |split| {
+                    self.relayout_above_split = null;
+                    const at = @min(split, above.len);
+                    try self.scrollLiveRegionAway(writer, above[0..at]);
+                    above = above[at..];
                 }
-
-                // Write each line, clearing to end of line
+                try self.renderInlineFrame(writer, view_output, above);
+            } else {
+                // Move cursor home (don't clear entire screen to reduce flicker)
+                try writer.writeAll(ansi.cursor_home);
                 var lines = std.mem.splitScalar(u8, view_output, '\n');
                 var first = true;
                 var line_count: usize = 0;
@@ -1031,33 +1054,154 @@ pub fn Program(comptime Model: type) type {
                     try writer.writeAll(ansi.line_clear_right);
                     line_count += 1;
                 }
-
-                // Clear remaining lines if previous content was taller
-                const visible_line_count = if (self.options.inline_bottom_viewport)
-                    @min(line_count, @as(usize, self.context.height))
-                else
-                    line_count;
-                const previous_line_count = if (self.options.inline_bottom_viewport)
-                    @min(self.last_line_count, @as(usize, self.context.height))
-                else
-                    self.last_line_count;
-                if (previous_line_count > visible_line_count) {
-                    var remaining = previous_line_count - visible_line_count;
+                if (self.last_line_count > line_count) {
+                    var remaining = self.last_line_count - line_count;
                     while (remaining > 0) : (remaining -= 1) {
                         try writer.writeAll("\r\n");
                         try writer.writeAll(ansi.line_clear);
                     }
                 }
-                self.last_line_count = visible_line_count;
-
-                // End synchronized output
-                try writer.writeAll(ansi.sync_end);
-
-                try self.terminal.?.flush();
-
-                // Save hash for comparison
-                self.last_view_hash = view_hash;
+                self.last_line_count = line_count;
             }
+            self.context.above_buffer.clearRetainingCapacity();
+
+            // End synchronized output
+            try writer.writeAll(ansi.sync_end);
+            try self.terminal.?.flush();
+
+            // Save hash for comparison
+            self.last_view_hash = view_hash;
+            self.needs_repaint = false;
+        }
+
+        fn renderInlineFrame(self: *Self, writer: *std.Io.Writer, view_output: []const u8, above: []const u8) !void {
+            const height: usize = @max(@as(usize, self.context.height), 1);
+            const width: usize = @max(@as(usize, self.context.width), 1);
+            try self.moveToLiveRegionTop(writer);
+            try writeAboveLines(writer, above, width);
+
+            var frame_lines: std.ArrayList([]const u8) = .empty;
+            defer frame_lines.deinit(self.allocator);
+            var skip = countLines(view_output) -| height;
+            var lines = std.mem.splitScalar(u8, view_output, '\n');
+            while (lines.next()) |line| {
+                if (skip > 0) {
+                    skip -= 1;
+                    continue;
+                }
+                try frame_lines.append(self.allocator, line);
+            }
+
+            const reuse = above.len == 0 and self.last_line_count > 0;
+            var old_lines = std.mem.splitScalar(u8, self.last_frame.items, '\n');
+            var next_frame: std.ArrayList(u8) = .empty;
+            defer next_frame.deinit(self.allocator);
+            self.last_line_widths.clearRetainingCapacity();
+            for (frame_lines.items, 0..) |line, i| {
+                const old = old_lines.next();
+                if (i > 0) try next_frame.append(self.allocator, '\n');
+                try next_frame.appendSlice(self.allocator, line);
+                try self.last_line_widths.append(self.allocator, @min(inkWidth(line), width));
+                if (i + 1 == frame_lines.items.len) {
+                    try writer.writeAll(ansi.screen_clear_below);
+                    _ = try writeClampedLine(writer, line, width);
+                    break;
+                }
+                const unchanged = reuse and i + 1 < self.last_line_count and old != null and std.mem.eql(u8, old.?, line);
+                if (unchanged) {
+                    try writer.writeAll("\n");
+                    continue;
+                }
+                const used = try writeClampedLine(writer, line, width);
+                if (used < width) try writer.writeAll(ansi.line_clear_right);
+                try writer.writeAll("\r\n");
+            }
+            self.last_line_count = frame_lines.items.len;
+            self.last_frame.clearRetainingCapacity();
+            try self.last_frame.appendSlice(self.allocator, next_frame.items);
+        }
+
+        fn scrollLiveRegionAway(self: *Self, writer: *std.Io.Writer, above: []const u8) !void {
+            const height: usize = @max(@as(usize, self.context.height), 1);
+            const width: usize = @max(@as(usize, self.context.width), 1);
+            try self.moveToReflowedLiveRegionTop(writer);
+            try writer.writeAll(ansi.screen_clear_below);
+            try writeAboveLines(writer, above, width);
+            var n: usize = 0;
+            while (n < height) : (n += 1) try writer.writeAll("\r\n");
+            try writer.writeAll(ansi.cursor_home);
+            self.last_line_count = 0;
+            self.last_line_widths.clearRetainingCapacity();
+        }
+
+        fn moveToLiveRegionTop(self: *Self, writer: *std.Io.Writer) !void {
+            if (self.last_line_count > 1) {
+                const up: u16 = @intCast(@min(self.last_line_count - 1, std.math.maxInt(u16)));
+                try ansi.cursorUp(writer, up);
+            }
+            try writer.writeAll("\r");
+        }
+
+        fn moveToReflowedLiveRegionTop(self: *Self, writer: *std.Io.Writer) !void {
+            const width: usize = @max(@as(usize, self.context.width), 1);
+            const occupied = reflowedRowCount(self.last_line_widths.items, width);
+            if (occupied > 1) {
+                const up: u16 = @intCast(@min(occupied - 1, std.math.maxInt(u16)));
+                try ansi.cursorUp(writer, up);
+            }
+            try writer.writeAll("\r");
+        }
+
+        fn writeAboveLines(writer: *std.Io.Writer, above: []const u8, width: usize) !void {
+            if (above.len == 0) return;
+            const body = if (above[above.len - 1] == '\n') above[0 .. above.len - 1] else above;
+            var lines = std.mem.splitScalar(u8, body, '\n');
+            while (lines.next()) |line| {
+                try writer.writeAll(line);
+                if (visibleWidth(line) < width) try writer.writeAll(ansi.line_clear_right);
+                try writer.writeAll("\r\n");
+            }
+        }
+
+        fn finishInline(self: *Self) void {
+            if (self.terminal) |*term| {
+                const writer = term.writer();
+                writer.writeAll(ansi.sync_start) catch return;
+                self.moveToReflowedLiveRegionTop(writer) catch return;
+                writer.writeAll(ansi.screen_clear_below) catch return;
+                writeAboveLines(writer, self.context.above_buffer.items, @max(@as(usize, self.context.width), 1)) catch return;
+                self.context.above_buffer.clearRetainingCapacity();
+                self.last_line_count = 0;
+                self.last_line_widths.clearRetainingCapacity();
+                writer.writeAll(ansi.sync_end) catch return;
+                term.flush() catch return;
+            }
+        }
+
+        fn writeClampedLine(writer: *std.Io.Writer, line: []const u8, width: usize) !usize {
+            var i: usize = 0;
+            var used: usize = 0;
+            while (i < line.len) {
+                const c = line[i];
+                if (c == 0x1b) {
+                    const end = escapeSequenceEnd(line, i);
+                    try writer.writeAll(line[i..end]);
+                    i = end;
+                    continue;
+                }
+                const len = std.unicode.utf8ByteSequenceLength(c) catch 1;
+                const take = @min(len, line.len - i);
+                const codepoint: u21 = std.unicode.utf8Decode(line[i .. i + take]) catch c;
+                const cell_width = unicode.charWidth(codepoint);
+                if (used + cell_width > width) {
+                    i += take;
+                    continue;
+                }
+                try writer.writeAll(line[i .. i + take]);
+                used += cell_width;
+                i += take;
+            }
+            return used;
         }
 
         fn countLines(text: []const u8) usize {
@@ -1089,4 +1233,71 @@ pub fn Program(comptime Model: type) type {
             self.running.store(false, .release);
         }
     };
+}
+
+fn reflowedRowCount(widths: []const usize, width: usize) usize {
+    var rows: usize = 0;
+    for (widths) |w| rows += @max(1, (w + width - 1) / width);
+    return rows;
+}
+
+test "reflowedRowCount counts rewrapped rows at a narrower width" {
+    try std.testing.expectEqual(@as(usize, 5), reflowedRowCount(&.{ 0, 100, 100, 100, 100 }, 100));
+    try std.testing.expectEqual(@as(usize, 9), reflowedRowCount(&.{ 0, 100, 100, 100, 100 }, 70));
+    try std.testing.expectEqual(@as(usize, 5), reflowedRowCount(&.{ 0, 100, 100, 100, 100 }, 120));
+    try std.testing.expectEqual(@as(usize, 9), reflowedRowCount(&.{ 100, 41, 140 }, 40));
+    try std.testing.expectEqual(@as(usize, 0), reflowedRowCount(&.{}, 40));
+}
+
+fn inkWidth(line: []const u8) usize {
+    return visibleWidth(std.mem.trimEnd(u8, line, " "));
+}
+
+test "inkWidth ignores trailing padding but keeps styled cells" {
+    try std.testing.expectEqual(@as(usize, 0), inkWidth("          "));
+    try std.testing.expectEqual(@as(usize, 5), inkWidth("hello     "));
+    try std.testing.expectEqual(@as(usize, 8), inkWidth("\x1b[44mhello   \x1b[0m"));
+}
+
+fn visibleWidth(line: []const u8) usize {
+    var i: usize = 0;
+    var used: usize = 0;
+    while (i < line.len) {
+        const c = line[i];
+        if (c == 0x1b) {
+            i = escapeSequenceEnd(line, i);
+            continue;
+        }
+        const len = std.unicode.utf8ByteSequenceLength(c) catch 1;
+        const take = @min(len, line.len - i);
+        const codepoint: u21 = std.unicode.utf8Decode(line[i .. i + take]) catch c;
+        used += unicode.charWidth(codepoint);
+        i += take;
+    }
+    return used;
+}
+
+fn escapeSequenceEnd(text: []const u8, from: usize) usize {
+    var i = from + 1;
+    if (i >= text.len) return text.len;
+    const second = text[i];
+    i += 1;
+    switch (second) {
+        '[' => {
+            while (i < text.len) : (i += 1) {
+                const c = text[i];
+                if (c >= 0x40 and c <= 0x7e) return i + 1;
+            }
+            return text.len;
+        },
+        ']', 'P', '_', '^', 'X' => {
+            while (i < text.len) : (i += 1) {
+                if (text[i] == 0x07) return i + 1;
+                if (text[i] == 0x1b and i + 1 < text.len and text[i + 1] == '\\') return i + 2;
+            }
+            return text.len;
+        },
+        '(', ')', '*', '+' => return @min(text.len, i + 1),
+        else => return i,
+    }
 }
