@@ -19,6 +19,10 @@ else
     @import("platform/posix.zig");
 const mouse = @import("../input/mouse.zig");
 
+/// Every mouse-tracking mode this framework has enabled, disabled in one write.
+/// Setup sends it to clear modes a crashed previous run may have left on.
+pub const input_mode_reset = "\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
+
 pub const Size = platform.Size;
 pub const TerminalError = platform.TerminalError;
 
@@ -337,7 +341,10 @@ pub const Terminal = struct {
         try self.writeBytes(ansi.kitty_keyboard_reset);
         try self.writeBytes(ansi.bracketed_paste_disable);
         try self.writeBytes("\x1b[?1007l");
-        try self.writeBytes(mouse.disableSequence(.normal));
+        // Clear every mouse-tracking mode the framework has ever enabled, not
+        // just the one it enables now, so a crashed older run cannot leave
+        // motion reporting on.
+        try self.writeBytes(input_mode_reset);
 
         // Enter alternate screen
         if (self.config.alt_screen) {
@@ -1952,4 +1959,11 @@ test "parseKittyGraphicsProbeResponse truncated reply keeps reading" {
 test "parseKittyGraphicsProbeResponse superstring id does not match" {
     const bytes = "\x1b_Gi=99312;OK\x1b\\";
     try std.testing.expectEqual(@as(?bool, null), Terminal.parseKittyGraphicsProbeResponse(bytes, 9931));
+}
+
+test "input_mode_reset clears every mouse-tracking mode the framework enabled" {
+    try std.testing.expect(std.mem.indexOf(u8, input_mode_reset, "?1000l") != null);
+    try std.testing.expect(std.mem.indexOf(u8, input_mode_reset, "?1002l") != null);
+    try std.testing.expect(std.mem.indexOf(u8, input_mode_reset, "?1003l") != null);
+    try std.testing.expect(std.mem.indexOf(u8, input_mode_reset, "?1006l") != null);
 }

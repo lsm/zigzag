@@ -78,6 +78,7 @@ pub fn Program(comptime Model: type) type {
         last_line_count: usize,
         needs_repaint: bool,
         resize_deadline: ?u64,
+        bottom_anchor: bool,
         last_line_widths: std.ArrayList(usize),
         last_frame: std.ArrayList(u8),
         relayout_above_split: ?usize,
@@ -181,6 +182,7 @@ pub fn Program(comptime Model: type) type {
                 .last_line_count = 0,
                 .needs_repaint = false,
                 .resize_deadline = null,
+                .bottom_anchor = false,
                 .last_line_widths = .empty,
                 .last_frame = .empty,
                 .relayout_above_split = null,
@@ -578,6 +580,21 @@ pub fn Program(comptime Model: type) type {
             // Whatever was mid-sequence when we stopped will never be
             // completed; drop it instead of merging it with post-resume input.
             self.input_parser.reset();
+
+            // The shell wrote its prompt and `fg` output while we were stopped,
+            // so the cursor no longer marks the live region. Scroll to a known
+            // row and re-anchor the next frame there; forget the old frame so
+            // the reuse path cannot skip rows the shell overwrote.
+            if (self.options.inline_bottom_viewport) {
+                if (self.terminal) |*term| {
+                    const writer = term.writer();
+                    const height: usize = @max(@as(usize, self.context.height), 1);
+                    var n: usize = 0;
+                    while (n < height) : (n += 1) writer.writeAll("\r\n") catch break;
+                    term.flush() catch {};
+                }
+                self.reanchorInline();
+            }
 
             // Avoid a large post-resume delta, and rebase the pacing anchor so we
             // don't burst-render to "catch up" the suspended interval. Advance the
@@ -1046,8 +1063,6 @@ pub fn Program(comptime Model: type) type {
         fn renderInlineFrame(self: *Self, writer: *std.Io.Writer, view_output: []const u8, above: []const u8) !void {
             const height: usize = @max(@as(usize, self.context.height), 1);
             const width: usize = @max(@as(usize, self.context.width), 1);
-            try self.moveToLiveRegionTop(writer);
-            try writeAboveLines(writer, above, width);
 
             var frame_lines: std.ArrayList([]const u8) = .empty;
             defer frame_lines.deinit(self.allocator);
@@ -1060,6 +1075,21 @@ pub fn Program(comptime Model: type) type {
                 }
                 try frame_lines.append(self.allocator, line);
             }
+
+            if (self.bottom_anchor) {
+                // The cursor rests on the bottom row (scrollLiveRegionAway left
+                // it there), so anchor the frame's last row to that row instead
+                // of homing it to the top-left.
+                self.bottom_anchor = false;
+                try writer.writeAll("\r");
+                if (frame_lines.items.len > 1) {
+                    const up: u16 = @intCast(@min(frame_lines.items.len - 1, std.math.maxInt(u16)));
+                    try ansi.cursorUp(writer, up);
+                }
+            } else {
+                try self.moveToLiveRegionTop(writer);
+            }
+            try writeAboveLines(writer, above, width);
 
             const reuse = above.len == 0 and self.last_line_count > 0;
             var old_lines = std.mem.splitScalar(u8, self.last_frame.items, '\n');
@@ -1098,7 +1128,7 @@ pub fn Program(comptime Model: type) type {
             try writeAboveLines(writer, above, width);
             var n: usize = 0;
             while (n < height) : (n += 1) try writer.writeAll("\r\n");
-            try writer.writeAll(ansi.cursor_home);
+            self.bottom_anchor = true;
             self.last_line_count = 0;
             self.last_line_widths.clearRetainingCapacity();
         }
@@ -1158,9 +1188,20 @@ pub fn Program(comptime Model: type) type {
             }
         }
 
+        /// Re-establish the bottom anchor and drop the stale frame, for the
+        /// paths where another writer moved the cursor (resume after suspend).
+        fn reanchorInline(self: *Self) void {
+            self.bottom_anchor = true;
+            self.last_line_count = 0;
+            self.last_frame.clearRetainingCapacity();
+            self.last_line_widths.clearRetainingCapacity();
+            self.needs_repaint = true;
+        }
+
         fn writeClampedLine(writer: *std.Io.Writer, line: []const u8, width: usize) !usize {
             var i: usize = 0;
             var used: usize = 0;
+            var clipped = false;
             while (i < line.len) {
                 const c = line[i];
                 if (c == 0x1b) {
@@ -1173,7 +1214,11 @@ pub fn Program(comptime Model: type) type {
                 const take = @min(len, line.len - i);
                 const codepoint: u21 = std.unicode.utf8Decode(line[i .. i + take]) catch c;
                 const cell_width = unicode.charWidth(codepoint);
-                if (used + cell_width > width) {
+                if (clipped or used + cell_width > width) {
+                    // Past the truncation point: drop printable characters so a
+                    // wide glyph straddling the edge cannot pull later text in,
+                    // but keep emitting escape sequences (trailing resets).
+                    clipped = true;
                     i += take;
                     continue;
                 }
@@ -1281,3 +1326,106 @@ fn escapeSequenceEnd(text: []const u8, from: usize) usize {
         else => return i,
     }
 }
+
+const AnchorTestModel = struct {
+    pub const Msg = union(enum) { nop: void };
+
+    pub fn init(_: *AnchorTestModel, _: *Context) Cmd(AnchorTestModel.Msg) {
+        return .none;
+    }
+
+    pub fn update(_: *AnchorTestModel, _: AnchorTestModel.Msg, _: *Context) Cmd(AnchorTestModel.Msg) {
+        return .none;
+    }
+
+    pub fn view(_: *const AnchorTestModel, _: *const Context) []const u8 {
+        return "one\ntwo";
+    }
+};
+
+test "renderInlineFrame anchors a short frame to the bottom after a scroll" {
+    var env_map: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env_map.deinit();
+
+    var program = Program(AnchorTestModel).init(std.testing.allocator, std.testing.io, &env_map);
+    defer program.deinit();
+    program.options.inline_bottom_viewport = true;
+    program.context.allocator = program.arena.allocator();
+    program.context.width = 40;
+    program.context.height = 10;
+
+    // scrollLiveRegionAway leaves the cursor on the bottom row and asks the
+    // next frame to anchor there instead of homing to the top-left.
+    program.bottom_anchor = true;
+
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try program.renderInlineFrame(&out.writer, "one\ntwo", "");
+
+    // A two-row frame at height 10 must move up 1 from the bottom row, not home.
+    try std.testing.expect(std.mem.startsWith(u8, out.written(), "\r\x1b[1A"));
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\x1b[H") == null);
+    try std.testing.expectEqual(false, program.bottom_anchor);
+}
+
+test "scrollLiveRegionAway leaves the cursor at the bottom row" {
+    var env_map: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env_map.deinit();
+
+    var program = Program(AnchorTestModel).init(std.testing.allocator, std.testing.io, &env_map);
+    defer program.deinit();
+    program.options.inline_bottom_viewport = true;
+    program.context.allocator = program.arena.allocator();
+    program.context.width = 40;
+    program.context.height = 10;
+
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try program.scrollLiveRegionAway(&out.writer, "");
+
+    // One line feed per screen row, no cursor-home, and the next frame anchors.
+    try std.testing.expectEqual(@as(usize, 10), std.mem.count(u8, out.written(), "\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\x1b[H") == null);
+    try std.testing.expectEqual(true, program.bottom_anchor);
+}
+
+test "writeClampedLine stops at a wide character that crosses the edge" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    const used = try Program(AnchorTestModel).writeClampedLine(&out.writer, "123456789漢ab", 10);
+
+    // The wide glyph does not fit the last cell, so truncation stops before it
+    // and the trailing 'a' from beyond the boundary is not pulled in.
+    try std.testing.expectEqualStrings("123456789", out.written());
+    try std.testing.expectEqual(@as(usize, 9), used);
+}
+
+test "writeClampedLine still flushes escape sequences past the edge" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    _ = try Program(AnchorTestModel).writeClampedLine(&out.writer, "123456789漢\x1b[0m", 10);
+
+    // The reset after the truncation point is still written.
+    try std.testing.expectEqualStrings("123456789\x1b[0m", out.written());
+}
+
+test "reanchorInline drops the stale frame and re-anchors at the bottom" {
+    var env_map: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env_map.deinit();
+
+    var program = Program(AnchorTestModel).init(std.testing.allocator, std.testing.io, &env_map);
+    defer program.deinit();
+    program.context.allocator = program.arena.allocator();
+    program.last_line_count = 7;
+    try program.last_frame.appendSlice(program.allocator, "stale");
+    try program.last_line_widths.append(program.allocator, 5);
+
+    program.reanchorInline();
+
+    try std.testing.expectEqual(true, program.bottom_anchor);
+    try std.testing.expectEqual(@as(usize, 0), program.last_line_count);
+    try std.testing.expectEqual(@as(usize, 0), program.last_frame.items.len);
+    try std.testing.expectEqual(@as(usize, 0), program.last_line_widths.items.len);
+    try std.testing.expectEqual(true, program.needs_repaint);
+}
+

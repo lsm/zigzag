@@ -6,6 +6,7 @@ const Writer = std.Io.Writer;
 const style_mod = @import("../style/style.zig");
 const Color = @import("../style/color.zig").Color;
 const border_mod = @import("../style/border.zig");
+const unicode = @import("../unicode.zig");
 
 pub const Markdown = struct {
     // Styling
@@ -183,12 +184,13 @@ pub const Markdown = struct {
             if (in_code_block) {
                 const block_width = self.codeBlockWidth();
                 const inner_width = block_width - 4; // border + side padding
-                const visible_len = @min(line.len, inner_width);
+                const visible_len = clampToCells(line, inner_width);
+                const clipped = line[0..visible_len];
                 const start_bar = try self.code_block_border.render(tmp, "│ ");
                 try writer.writeAll(start_bar);
-                const styled = try self.code_block_style.render(tmp, line[0..visible_len]);
+                const styled = try self.code_block_style.render(tmp, clipped);
                 try writer.writeAll(styled);
-                for (visible_len..inner_width) |_| try writer.writeByte(' ');
+                for (displayWidth(clipped)..inner_width) |_| try writer.writeByte(' ');
                 const end_bar = try self.code_block_border.render(tmp, " │");
                 try writer.writeAll(end_bar);
                 continue;
@@ -360,6 +362,34 @@ pub const Markdown = struct {
         return @max(@as(usize, self.width), 8);
     }
 
+    fn displayWidth(text: []const u8) usize {
+        var i: usize = 0;
+        var cells: usize = 0;
+        while (i < text.len) {
+            const len = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
+            const take = @min(len, text.len - i);
+            const codepoint: u21 = std.unicode.utf8Decode(text[i .. i + take]) catch text[i];
+            cells += unicode.charWidth(codepoint);
+            i += take;
+        }
+        return cells;
+    }
+
+    fn clampToCells(text: []const u8, max_cells: usize) usize {
+        var i: usize = 0;
+        var cells: usize = 0;
+        while (i < text.len) {
+            const len = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
+            const take = @min(len, text.len - i);
+            const codepoint: u21 = std.unicode.utf8Decode(text[i .. i + take]) catch text[i];
+            const width = unicode.charWidth(codepoint);
+            if (cells + width > max_cells) break;
+            cells += width;
+            i += take;
+        }
+        return i;
+    }
+
     fn isAllChar(s: []const u8, c: u8) bool {
         for (s) |ch| {
             if (ch != c and ch != ' ') return false;
@@ -393,4 +423,71 @@ test "markdown renderer respects long backtick fence length" {
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "┌"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "└"));
     try std.testing.expect(std.mem.indexOf(u8, out, "```mermaid") != null);
+}
+
+test "markdown code block clamps wide characters on a cell boundary" {
+    const cjk = "漢" ** 40;
+    const src = "```\n" ++ cjk ++ "\n```";
+    var md = Markdown.init();
+    const out = try md.render(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+
+    // A byte clamp would cut the 26th wide character in half, leaving invalid
+    // UTF-8 in the styled output.
+    try std.testing.expect(std.unicode.utf8ValidateSlice(out));
+    // inner width 76 cells holds 38 wide characters exactly.
+    try std.testing.expectEqual(@as(usize, 38), std.mem.count(u8, out, "漢"));
+}
+
+test "markdown code block does not split an emoji" {
+    const emoji = "😀" ** 40;
+    const src = "```\n" ++ emoji ++ "\n```";
+    var md = Markdown.init();
+    const out = try md.render(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+
+    // A byte clamp would cut a four-byte codepoint in half.
+    try std.testing.expect(std.unicode.utf8ValidateSlice(out));
+}
+
+test "markdown code block pads wide characters by display cells" {
+    const cjk = "漢" ** 40;
+    const src = "```\n" ++ cjk ++ "\n```";
+    var md = Markdown.init();
+    const out = try md.render(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+
+    // block width 80, inner width 76 cells: the widest row is 38 wide
+    // characters (76 cells) plus the two border columns.
+    var widest: usize = 0;
+    var lines = std.mem.splitScalar(u8, out, '\n');
+    while (lines.next()) |line| {
+        const cells = strippedDisplayWidth(line);
+        if (cells > widest) widest = cells;
+    }
+    try std.testing.expectEqual(@as(usize, 80), widest);
+}
+
+fn strippedDisplayWidth(text: []const u8) usize {
+    var i: usize = 0;
+    var cells: usize = 0;
+    while (i < text.len) {
+        if (text[i] == 0x1b) {
+            i += 1;
+            if (i < text.len and text[i] == '[') {
+                i += 1;
+                while (i < text.len and !(text[i] >= 0x40 and text[i] <= 0x7e)) i += 1;
+                if (i < text.len) i += 1;
+                continue;
+            }
+            if (i < text.len) i += 1;
+            continue;
+        }
+        const len = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
+        const take = @min(len, text.len - i);
+        const codepoint: u21 = std.unicode.utf8Decode(text[i .. i + take]) catch text[i];
+        cells += unicode.charWidth(codepoint);
+        i += take;
+    }
+    return cells;
 }
