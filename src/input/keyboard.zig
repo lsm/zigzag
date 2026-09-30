@@ -342,6 +342,8 @@ fn parseCsi(data: []const u8) ?ParseReturn {
             break;
         }
     }
+    // More parameters than any key report carries: not a sequence we know.
+    if (param_count == params.len) return null;
     param_count += 1;
 
     if (idx >= data.len) return null;
@@ -746,4 +748,9 @@ fn utf8BoundaryFloor(bytes: []const u8) usize {
         return if (i + need <= bytes.len) bytes.len else i;
     }
     return bytes.len;
+}
+
+test "parseCsi rejects more parameters than it can hold" {
+    try std.testing.expect(parseCsi("\x1b[1;2;3;4;5;6;7;8;u") == null);
+    try std.testing.expect(parseCsi("\x1b[1;2;3;4;5;6;7;8;9u") == null);
 }
