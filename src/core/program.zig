@@ -1099,7 +1099,7 @@ pub fn Program(comptime Model: type) type {
             }
             try writeAboveLines(writer, above, width);
 
-            const reuse = self.options.render_mode == .diff and above.len == 0 and self.last_line_count > 0;
+            const reuse = self.options.render_mode == .diff and !self.needs_repaint and above.len == 0 and self.last_line_count > 0;
             var old_lines = std.mem.splitScalar(u8, self.last_frame.items, '\n');
             var next_frame: std.ArrayList(u8) = .empty;
             defer next_frame.deinit(self.allocator);
@@ -1170,16 +1170,14 @@ pub fn Program(comptime Model: type) type {
             }
         }
 
-        /// Repaint the whole frame on the next render. A pending resize still
-        /// owes the model its window_size message and the relayout, so it
-        /// survives. The inline renderer also keeps the rows it drew so it can
-        /// find their top; the full-screen path forgets the previous frame's rows.
+        /// Repaint the whole frame on the next render. Only the row-diff cache
+        /// goes: the renderer still needs the rows it drew to find their top
+        /// (inline) and to clear the ones a shorter frame leaves behind (full
+        /// screen), and a pending resize still owes the model its window_size
+        /// message and the relayout.
         pub fn invalidate(self: *Self) void {
             self.needs_repaint = true;
             self.last_frame.clearRetainingCapacity();
-            if (self.options.inline_bottom_viewport) return;
-            self.last_line_count = 0;
-            self.last_line_widths.clearRetainingCapacity();
         }
 
         fn finishInline(self: *Self) void {
@@ -1451,7 +1449,7 @@ test "invalidate in inline mode repaints every row in place and keeps a pending 
     try std.testing.expect(std.mem.indexOf(u8, second.written(), "two") != null);
 }
 
-test "invalidate outside inline mode forgets the previous frame's rows but keeps a pending resize" {
+test "invalidate outside inline mode keeps the row count and a pending resize" {
     var env_map: std.process.Environ.Map = .init(std.testing.allocator);
     defer env_map.deinit();
 
@@ -1464,10 +1462,33 @@ test "invalidate outside inline mode forgets the previous frame's rows but keeps
 
     program.invalidate();
 
-    try std.testing.expectEqual(@as(usize, 0), program.last_line_count);
-    try std.testing.expectEqual(@as(usize, 0), program.last_line_widths.items.len);
+    try std.testing.expectEqual(@as(usize, 3), program.last_line_count);
     try std.testing.expectEqual(@as(?u64, 42), program.resize_deadline);
     try std.testing.expect(program.needs_repaint);
+}
+
+test "an inline repaint after invalidate rewrites a blank first row" {
+    var env_map: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env_map.deinit();
+
+    var program = Program(AnchorTestModel).init(std.testing.allocator, std.testing.io, &env_map);
+    defer program.deinit();
+    program.options.inline_bottom_viewport = true;
+    program.context.allocator = program.arena.allocator();
+    program.context.width = 40;
+    program.context.height = 10;
+
+    var first: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer first.deinit();
+    try program.renderInlineFrame(&first.writer, "one\ntwo", "");
+
+    program.invalidate();
+
+    var second: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer second.deinit();
+    try program.renderInlineFrame(&second.writer, "\ntwo", "");
+
+    try std.testing.expect(std.mem.startsWith(u8, second.written(), "\x1b[1A\r" ++ ansi.line_clear_right ++ "\r\n"));
 }
 
 test "render_mode full rewrites the unchanged rows that diff skips" {
