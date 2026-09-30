@@ -1162,17 +1162,16 @@ pub fn Program(comptime Model: type) type {
             }
         }
 
-        /// Repaint the whole frame on the next render. The inline renderer
-        /// still has to find the top of the rows it drew and still owes a
-        /// pending resize relayout, so inline mode only drops the row-diff
-        /// cache; the full-screen path forgets the previous frame entirely.
+        /// Repaint the whole frame on the next render. A pending resize still
+        /// owes the model its window_size message and the relayout, so it
+        /// survives. The inline renderer also keeps the rows it drew so it can
+        /// find their top; the full-screen path forgets the previous frame's rows.
         pub fn invalidate(self: *Self) void {
             self.needs_repaint = true;
             self.last_frame.clearRetainingCapacity();
             if (self.options.inline_bottom_viewport) return;
             self.last_line_count = 0;
             self.last_line_widths.clearRetainingCapacity();
-            self.resize_deadline = null;
         }
 
         fn finishInline(self: *Self) void {
@@ -1401,7 +1400,7 @@ test "invalidate in inline mode repaints every row in place and keeps a pending 
     try std.testing.expect(std.mem.indexOf(u8, second.written(), "two") != null);
 }
 
-test "invalidate outside inline mode forgets the rows and relayout of the previous frame" {
+test "invalidate outside inline mode forgets the previous frame's rows but keeps a pending resize" {
     var env_map: std.process.Environ.Map = .init(std.testing.allocator);
     defer env_map.deinit();
 
@@ -1416,7 +1415,7 @@ test "invalidate outside inline mode forgets the rows and relayout of the previo
 
     try std.testing.expectEqual(@as(usize, 0), program.last_line_count);
     try std.testing.expectEqual(@as(usize, 0), program.last_line_widths.items.len);
-    try std.testing.expectEqual(@as(?u64, null), program.resize_deadline);
+    try std.testing.expectEqual(@as(?u64, 42), program.resize_deadline);
     try std.testing.expect(program.needs_repaint);
 }
 
