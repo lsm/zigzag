@@ -54,21 +54,26 @@ pub const LayerStack = struct {
     }
 
     /// Composite all layers and return the final rendered string.
-    pub fn render(self: *const LayerStack, allocator: std.mem.Allocator) []const u8 {
+    ///
+    /// Fallible on purpose: an allocation failure part-way through used to
+    /// return an empty or truncated frame, which reaches the screen looking
+    /// like a rendering bug rather than an error.
+    pub fn render(self: *const LayerStack, allocator: std.mem.Allocator) ![]const u8 {
         const w: usize = self.width;
         const h: usize = self.height;
 
         // Create cell buffer: each cell stores a byte slice (content) and ANSI state
         // For simplicity, we use a 2D grid of cells that stores display characters
-        const grid = allocator.alloc(Cell, w * h) catch return "";
+        const grid = try allocator.alloc(Cell, w * h);
 
         // Fill with background
+        const bg = [1]u8{self.background};
         for (grid) |*cell| {
-            cell.* = .{ .char = self.background, .ansi_prefix = "" };
+            cell.* = .{ .content = &bg, .ansi_prefix = "" };
         }
 
         // Sort layers by z-index
-        const sorted = allocator.alloc(Layer, self.layers.items.len) catch return "";
+        const sorted = try allocator.alloc(Layer, self.layers.items.len);
         @memcpy(sorted, self.layers.items);
         std.mem.sort(Layer, sorted, {}, struct {
             fn lessThan(_: void, a: Layer, b: Layer) bool {
@@ -86,15 +91,17 @@ pub const LayerStack = struct {
         const writer = &result.writer;
 
         for (0..h) |row| {
-            if (row > 0) writer.writeByte('\n') catch {};
+            if (row > 0) try writer.writeByte('\n');
             for (0..w) |col| {
                 const cell = grid[row * w + col];
+                // Empty content marks the second column of a wide character
+                if (cell.content.len == 0) continue;
                 if (cell.ansi_prefix.len > 0) {
-                    writer.writeAll(cell.ansi_prefix) catch {};
-                    writer.writeByte(cell.char) catch {};
-                    writer.writeAll("\x1b[0m") catch {};
+                    try writer.writeAll(cell.ansi_prefix);
+                    try writer.writeAll(cell.content);
+                    try writer.writeAll("\x1b[0m");
                 } else {
-                    writer.writeByte(cell.char) catch {};
+                    try writer.writeAll(cell.content);
                 }
             }
         }
@@ -135,22 +142,36 @@ pub const LayerStack = struct {
                 continue;
             }
 
-            if (col < w) {
-                const is_transparent = layer.transparent and content[i] == ' ' and current_ansi.len == 0;
-                if (!is_transparent) {
-                    grid[row * w + col] = .{
-                        .char = content[i],
-                        .ansi_prefix = current_ansi,
-                    };
+            // Decode one UTF-8 character; treat invalid bytes as single cells
+            const char_len = std.unicode.utf8ByteSequenceLength(content[i]) catch 1;
+            const end = @min(i + char_len, content.len);
+            const char = content[i..end];
+            const codepoint: u21 = std.unicode.utf8Decode(char) catch content[i];
+            const char_width = measure.charWidth(codepoint);
+            i = end;
+
+            // Zero-width characters (e.g. combining marks) get no cell
+            if (char_width == 0) continue;
+
+            const is_transparent = layer.transparent and codepoint == ' ' and current_ansi.len == 0;
+            if (!is_transparent and col + char_width <= w) {
+                grid[row * w + col] = .{
+                    .content = char,
+                    .ansi_prefix = current_ansi,
+                };
+                // A wide character covers the following cell as well
+                if (char_width == 2) {
+                    grid[row * w + col + 1] = .{ .content = "" };
                 }
-                col += 1;
             }
-            i += 1;
+            col += char_width;
         }
     }
 };
 
 const Cell = struct {
-    char: u8 = ' ',
+    /// UTF-8 bytes of the character in this cell.
+    /// Empty for the second column of a wide character.
+    content: []const u8 = " ",
     ansi_prefix: []const u8 = "",
 };

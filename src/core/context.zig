@@ -9,6 +9,7 @@ const unicode_mod = @import("../unicode.zig");
 const Logger = @import("log.zig").Logger;
 const theme_mod = @import("../style/theme.zig");
 const Environment = @import("environment.zig").Environment;
+const frame_mod = @import("../terminal/frame.zig");
 
 /// Runtime context passed to init, update, and view functions
 pub const Context = struct {
@@ -420,4 +421,21 @@ pub const Options = struct {
     suspend_enabled: bool = true,
 
     ctrl_c_quits: bool = true,
+
+    /// How long a lone ESC waits for the rest of an escape sequence before it
+    /// is delivered as the Escape key (milliseconds).
+    ///
+    /// A bare ESC is byte-for-byte the start of every arrow key, function key
+    /// and mouse report, so the two can only be told apart by whether more
+    /// input follows. Lower values make Escape feel snappier; raise it if
+    /// sequences arrive in pieces over a slow link (ssh, serial).
+    escape_timeout_ms: u32 = 50,
+
+    /// How an inline frame (`inline_bottom_viewport`) is pushed to the terminal.
+    ///
+    /// `.diff` skips the rows that match the previous frame, which is what
+    /// keeps a spinner next to a streaming log from costing a full repaint
+    /// several times a second. `.full` rewrites every row of every frame. The
+    /// full-screen path always rewrites every row.
+    render_mode: frame_mod.Mode = .diff,
 };

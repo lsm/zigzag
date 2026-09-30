@@ -2,7 +2,6 @@
 //! Demonstrates mouse tracking, hit testing, and interactive buttons.
 
 const std = @import("std");
-const Writer = std.Io.Writer;
 const zz = @import("zigzag");
 
 const Model = struct {
@@ -36,7 +35,7 @@ const Model = struct {
         return .enable_mouse;
     }
 
-    pub fn update(self: *Model, msg: Msg, ctx: *zz.Context) zz.Cmd(Msg) {
+    pub fn update(self: *Model, msg: Msg, _: *zz.Context) zz.Cmd(Msg) {
         switch (msg) {
             .key => |k| switch (k.key) {
                 .char => |c| if (c == 'q') return .quit,
@@ -58,11 +57,10 @@ const Model = struct {
                                 },
                                 1 => {
                                     self.click_count += 1;
-                                    self.last_event = std.fmt.allocPrint(
-                                        ctx.allocator,
-                                        "Count: {d}",
-                                        .{self.click_count},
-                                    ) catch "Count++";
+                                    // ctx.allocator is a per-frame arena, so
+                                    // strings stored in the model must not be
+                                    // allocated from it.
+                                    self.last_event = "Count incremented!";
                                 },
                                 2 => {
                                     self.click_count = 0;
@@ -82,35 +80,38 @@ const Model = struct {
     }
 
     fn buttonHitBox(index: usize) zz.HitBox {
-        // Buttons start at row 5, spaced 14 columns apart
-        const x: u16 = @intCast(2 + index * 16);
-        return zz.HitBox.init(x, 5, 14, 3);
+        // The three buttons render as a horizontal row starting at row 4
+        // (after the title, mouse coords, count, and a blank line). Each box
+        // is 14 columns wide (12-char label + 2 border) with a 2-column gap,
+        // so the boxes start 16 columns apart.
+        const x: u16 = @intCast(index * 16);
+        return zz.HitBox.init(x, 4, 14, 3);
     }
 
-    pub fn view(self: *const Model, ctx: *const zz.Context) []const u8 {
+    pub fn view(self: *const Model, ctx: *const zz.Context) ![]const u8 {
         var title_style = zz.Style{};
         title_style = title_style.bold(true);
         title_style = title_style.fg(zz.Color.white);
         title_style = title_style.inline_style(true);
-        const title = title_style.render(ctx.allocator, "Mouse Demo") catch "Mouse Demo";
+        const title = try title_style.render(ctx.allocator, "Mouse Demo");
 
-        const coords = std.fmt.allocPrint(
+        const coords = try std.fmt.allocPrint(
             ctx.allocator,
             "Mouse: ({d}, {d})  |  {s}",
             .{ self.mouse_x, self.mouse_y, self.last_event },
-        ) catch "";
+        );
 
-        const count_str = std.fmt.allocPrint(
+        const count_str = try std.fmt.allocPrint(
             ctx.allocator,
             "Click count: {d}",
             .{self.click_count},
-        ) catch "";
+        );
 
-        // Render buttons
-        var buttons_line: Writer.Allocating = .init(ctx.allocator);
-        const bw = &buttons_line.writer;
+        // Render each button as its own bordered box, then place the boxes
+        // side by side with joinHorizontal. Each box is multi-line, so simply
+        // concatenating them would stair-step the boxes diagonally (issue #117).
+        var boxes: [self.buttons.len][]const u8 = undefined;
         for (&self.buttons, 0..) |*btn, i| {
-            if (i > 0) bw.writeAll("  ") catch {};
             var s = zz.Style{};
             s = s.borderAll(zz.Border.rounded);
             if (btn.mouse.hover) {
@@ -121,21 +122,22 @@ const Model = struct {
             }
             s = s.fg(btn.color);
             s = s.inline_style(false);
-            const rendered = s.render(ctx.allocator, btn.label) catch btn.label;
-            bw.writeAll(rendered) catch {};
+            boxes[i] = try s.render(ctx.allocator, btn.label);
         }
-        const buttons = buttons_line.toOwnedSlice() catch "";
+        const buttons = try zz.joinHorizontal(ctx.allocator, &.{
+            boxes[0], "  ", boxes[1], "  ", boxes[2],
+        });
 
         var help_s = zz.Style{};
         help_s = help_s.fg(zz.Color.gray(12));
         help_s = help_s.inline_style(true);
-        const help = help_s.render(ctx.allocator, "Click the buttons above | q: quit") catch "";
+        const help = try help_s.render(ctx.allocator, "Click the buttons above | q: quit");
 
         return std.fmt.allocPrint(
             ctx.allocator,
             "{s}\n{s}\n{s}\n\n{s}\n\n{s}",
             .{ title, coords, count_str, buttons, help },
-        ) catch "Error";
+        );
     }
 };
 
