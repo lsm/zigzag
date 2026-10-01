@@ -124,7 +124,8 @@ pub const LayerStack = struct {
                 const cell = grid[row * w + col];
                 // Empty content marks the second column of a wide character
                 if (cell.content.len == 0) continue;
-                if (cell.ansi_prefix.len > 0) {
+                // A mark styled apart from its base carries its own escape.
+                if (cell.ansi_prefix.len > 0 or std.mem.indexOfScalar(u8, cell.content, 0x1b) != null) {
                     try writer.writeAll(cell.ansi_prefix);
                     try writer.writeAll(cell.content);
                     try writer.writeAll("\x1b[0m");
@@ -150,6 +151,8 @@ pub const LayerStack = struct {
         var last_start: usize = 0;
         var last_end: usize = 0;
         var last_sliced = true;
+        // The style in effect at the end of that cell's text.
+        var last_style: []const u8 = "";
 
         while (i < content.len and row < h) {
             if (content[i] == '\n') {
@@ -193,12 +196,19 @@ pub const LayerStack = struct {
             // cluster narrower or wider than the per-code-point width every
             // layout here measures, which would shift the rest of the row.
             // A style escape between the two takes no column, so the mark
-            // still joins the cell; its bytes are copied when not adjacent.
+            // still joins the cell, copied onto its text when the bytes are
+            // not adjacent, and switching to the mark's own style if that
+            // differs from the style the cell's text ends in.
             if (char_width == 0) {
                 if (attachesToPrevious(codepoint)) {
                     if (last_cell) |at| {
-                        if (last_sliced and last_end == start) {
+                        const restyle = !std.mem.eql(u8, current_ansi, last_style);
+                        if (last_sliced and last_end == start and !restyle) {
                             plane[at].?.content = content[last_start..end];
+                        } else if (restyle) {
+                            plane[at].?.content = try std.mem.concat(allocator, u8, &.{ plane[at].?.content, "\x1b[0m", current_ansi, char });
+                            last_style = current_ansi;
+                            last_sliced = false;
                         } else {
                             plane[at].?.content = try std.mem.concat(allocator, u8, &.{ plane[at].?.content, char });
                             last_sliced = false;
@@ -220,6 +230,7 @@ pub const LayerStack = struct {
                 last_start = start;
                 last_end = end;
                 last_sliced = true;
+                last_style = current_ansi;
                 // A wide character covers the following cell as well
                 if (char_width == 2) {
                     plane[at + 1] = .{ .content = "" };
@@ -237,7 +248,9 @@ pub const LayerStack = struct {
 fn attachesToPrevious(codepoint: u21) bool {
     if (unicode.codepointWidth(codepoint) != 0) return false;
     return switch (codepoint) {
-        0x200D, 0xFE0E, 0xFE0F => false,
+        // Zero-width joiner, text and emoji presentation selectors, and the
+        // enclosing keycap, which turns `1` into a two-column keycap.
+        0x200D, 0xFE0E, 0xFE0F, 0x20E3 => false,
         else => true,
     };
 }

@@ -236,7 +236,7 @@ test "layer.LayerStack - a combining mark stays with its base character" {
     try testing.expectEqualStrings("e\u{301}x  ", try stack.render(allocator));
 }
 
-test "layer.LayerStack - a combining mark stays with its base across a style escape" {
+test "layer.LayerStack - combining marks styled apart from their base keep their style" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -247,7 +247,21 @@ test "layer.LayerStack - a combining mark stays with its base across a style esc
 
     try stack.push(.{ .content = "e\x1b[2m\u{301}\u{302}\x1b[0mx", .transparent = false });
 
-    try testing.expectEqualStrings("e\u{301}\u{302}x ", try stack.render(allocator));
+    try testing.expectEqualStrings("e\x1b[0m\x1b[2m\u{301}\u{302}\x1b[0mx ", try stack.render(allocator));
+}
+
+test "layer.LayerStack - a keycap mark is dropped so its base keeps one column" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var stack = zz.layout.layer.LayerStack.init(allocator);
+    defer stack.deinit();
+    stack.setSize(3, 1);
+
+    try stack.push(.{ .content = "1\u{FE0F}\u{20E3}X", .transparent = false });
+
+    try testing.expectEqualStrings("1X ", try stack.render(allocator));
 }
 
 test "layer.LayerStack - a joiner is dropped so an emoji sequence keeps its measured columns" {
