@@ -708,12 +708,18 @@ pub const InputParser = struct {
             const chunk = self.buf[offset..self.len];
 
             if (self.discarding != .none) {
-                // An ESC held as a possible start of ST that outlives the
-                // escape timeout was an Escape key: the dropped string ends
-                // there, and the ESC takes the lone-Escape path.
+                // An ESC held as a possible start of ST waits for the next
+                // byte however long it takes: a `\` completes ST even late, so
+                // a slow terminal never fakes an Escape. Any other byte after
+                // the escape timeout shows the ESC was an Escape key; it is
+                // delivered alone so that byte is not read as Alt-modified.
+                const string = self.discarding == .string_bel_or_st or self.discarding == .string_st;
                 const waited = now_ns -| self.holding_since_ns;
-                if (chunk.len == 1 and chunk[0] == 0x1b and self.holding and waited >= self.escape_timeout_ns) {
+                if (string and chunk.len >= 2 and chunk[0] == 0x1b and chunk[1] != '\\' and self.holding and waited >= self.escape_timeout_ns) {
+                    try appendResult(allocator, results, .{ .key = .{ .key = .escape } });
+                    offset += 1;
                     self.discarding = .none;
+                    self.holding = false;
                     continue;
                 }
                 offset += skipDiscarded(&self.discarding, chunk);
