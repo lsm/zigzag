@@ -177,6 +177,51 @@ fn frameCsi(data: []const u8) Frame {
 
 const StringTerm = enum { bel_or_st, st_only };
 
+/// How the tail of an unfinished escape sequence ends, for the sequences
+/// framed by a terminator rather than a fixed length.
+fn discardKind(data: []const u8) ?InputParser.Discard {
+    if (data.len < 2) return null;
+    return switch (data[1]) {
+        '[' => .csi,
+        ']' => .string_bel_or_st,
+        'P', '_', '^', 'X' => .string_st,
+        else => null,
+    };
+}
+
+/// Skip the tail of a dropped sequence, returning how many bytes of `data`
+/// belong to it and clearing `state` once its terminator has gone by.
+fn skipDiscarded(state: *InputParser.Discard, data: []const u8) usize {
+    switch (state.*) {
+        .none => return 0,
+        .csi => {
+            var i: usize = 0;
+            while (i < data.len and data[i] >= 0x20 and data[i] <= 0x3f) : (i += 1) {}
+            if (i == data.len) return i;
+            state.* = .none;
+            return if (data[i] >= 0x40 and data[i] <= 0x7e) i + 1 else i;
+        },
+        .string_bel_or_st, .string_st => {
+            var i: usize = 0;
+            while (i < data.len) : (i += 1) {
+                if (data[i] == 0x07 and state.* == .string_bel_or_st) {
+                    state.* = .none;
+                    return i + 1;
+                }
+                if (data[i] == 0x1b) {
+                    // An ESC at the very end may be the first half of ST.
+                    if (i + 1 == data.len) return i;
+                    if (data[i + 1] == '\\') {
+                        state.* = .none;
+                        return i + 2;
+                    }
+                }
+            }
+            return i;
+        },
+    }
+}
+
 /// OSC/DCS/APC/PM/SOS strings run until ST (ESC \), and OSC also until BEL.
 fn frameString(data: []const u8, term: StringTerm) Frame {
     var i: usize = 2;
@@ -567,6 +612,11 @@ pub const InputParser = struct {
     holding_since_ns: u64 = 0,
     /// How long a partial sequence waits before being read as a bare Escape.
     escape_timeout_ns: u64 = default_escape_timeout_ns,
+    /// Set while the tail of an escape sequence too long for the buffer is
+    /// still arriving; its bytes are skipped until the sequence ends.
+    discarding: Discard = .none,
+
+    const Discard = enum { none, csi, string_bel_or_st, string_st };
 
     /// Feed one read's worth of bytes and collect the events they complete.
     ///
@@ -615,6 +665,7 @@ pub const InputParser = struct {
     pub fn reset(self: *InputParser) void {
         self.clearBuffer();
         self.in_paste = false;
+        self.discarding = .none;
     }
 
     fn clearBuffer(self: *InputParser) void {
@@ -633,6 +684,12 @@ pub const InputParser = struct {
 
         while (offset < self.len) {
             const chunk = self.buf[offset..self.len];
+
+            if (self.discarding != .none) {
+                offset += skipDiscarded(&self.discarding, chunk);
+                if (self.discarding != .none) break;
+                continue;
+            }
 
             if (self.in_paste) {
                 const consumed = try self.drainPaste(allocator, results, chunk, force);
@@ -657,6 +714,21 @@ pub const InputParser = struct {
                     const waited = now_ns -| self.holding_since_ns;
                     const timed_out = self.holding and waited >= self.escape_timeout_ns;
                     if (!force and !timed_out) break;
+
+                    // The buffer filled while an escape sequence was still
+                    // open. Started mid-buffer, it is moved to the front to
+                    // make room for the rest. Filling the whole buffer, it can
+                    // never complete here: replaying it would read as Escape
+                    // followed by its payload typed as text, so it is dropped
+                    // and the rest of it skipped as it arrives.
+                    if (force and chunk[0] == 0x1b) {
+                        if (offset > 0) break;
+                        if (discardKind(chunk)) |kind| {
+                            self.discarding = kind;
+                            offset = self.len;
+                            break;
+                        }
+                    }
 
                     const parsed = parseFlush(chunk);
                     if (parsed.consumed == 0) break;

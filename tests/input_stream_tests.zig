@@ -347,17 +347,19 @@ test "a sequence that never terminates cannot stall the stream" {
     defer h.deinit();
 
     // A CSI whose parameter run is longer than the whole buffer: the parser
-    // must give up on it rather than block every later key press.
+    // must give up on it rather than block every later key press. It is
+    // dropped, not replayed as Escape and digits, and it ends at the first
+    // byte that can close a CSI, so only the key after that comes through.
     var garbage = std.array_list.Managed(u8).init(testing.allocator);
     defer garbage.deinit();
     try garbage.appendSlice("\x1b[");
     try garbage.appendNTimes('1', InputParser.capacity * 2);
 
     try h.feed(garbage.items);
-    try h.feed("k");
+    try h.feed("kj");
 
-    const last = h.events.items[h.events.items.len - 1];
-    try testing.expectEqual(@as(u21, 'k'), last.key.key.char);
+    try testing.expectEqual(@as(usize, 1), h.events.items.len);
+    try testing.expectEqual(@as(u21, 'j'), h.events.items[0].key.key.char);
     try testing.expect(h.parser.pending().len < InputParser.capacity);
 }
 
@@ -470,4 +472,52 @@ test "parseAll drops complete sequences it has no event for" {
     try testing.expectEqual(@as(usize, 2), events.len);
     try testing.expectEqual(@as(u21, 'a'), events[0].key.key.char);
     try testing.expectEqual(@as(u21, 'b'), events[1].key.key.char);
+}
+
+test "an escape sequence longer than the buffer is dropped, not typed" {
+    var h = Harness.init();
+    defer h.deinit();
+
+    var data = std.array_list.Managed(u8).init(testing.allocator);
+    defer data.deinit();
+    try data.appendSlice("\x1b[");
+    for (0..3000) |_| try data.appendSlice("1;");
+    try data.appendSlice("ua");
+
+    try h.feed(data.items);
+
+    try testing.expectEqual(@as(usize, 1), h.events.items.len);
+    try testing.expectEqual(@as(u21, 'a'), h.events.items[0].key.key.char);
+}
+
+test "an oversized string sequence split across reads is dropped, not typed" {
+    var h = Harness.init();
+    defer h.deinit();
+
+    var data = std.array_list.Managed(u8).init(testing.allocator);
+    defer data.deinit();
+    try data.appendSlice("\x1b]52;c;");
+    for (0..6000) |_| try data.append('A');
+    try data.appendSlice("\x1b\\b");
+
+    try h.feed(data.items[0..5000]);
+    try h.feed(data.items[5000..]);
+
+    try testing.expectEqual(@as(usize, 1), h.events.items.len);
+    try testing.expectEqual(@as(u21, 'b'), h.events.items[0].key.key.char);
+}
+
+test "a sequence straddling a full buffer is completed, not dropped" {
+    var h = Harness.init();
+    defer h.deinit();
+
+    var data = std.array_list.Managed(u8).init(testing.allocator);
+    defer data.deinit();
+    try data.appendNTimes('x', InputParser.capacity - 2);
+    try data.appendSlice("\x1b[A");
+
+    try h.feed(data.items);
+
+    try testing.expectEqual(InputParser.capacity - 1, h.events.items.len);
+    try testing.expect(h.events.items[h.events.items.len - 1].key.key == .up);
 }
