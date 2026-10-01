@@ -222,6 +222,34 @@ test "layer.LayerStack - wide characters cover two cells" {
     try testing.expectEqualStrings("你a ", try stack.render(allocator));
 }
 
+test "layer.LayerStack - a combining mark stays with its base character" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var stack = zz.layout.layer.LayerStack.init(allocator);
+    defer stack.deinit();
+    stack.setSize(4, 1);
+
+    try stack.push(.{ .content = "e\u{301}x", .transparent = false });
+
+    try testing.expectEqualStrings("e\u{301}x  ", try stack.render(allocator));
+}
+
+test "layer.LayerStack - a joiner keeps an emoji sequence contiguous" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var stack = zz.layout.layer.LayerStack.init(allocator);
+    defer stack.deinit();
+    stack.setSize(5, 1);
+
+    try stack.push(.{ .content = "\u{1F468}\u{200D}\u{1F469}", .transparent = false });
+
+    try testing.expectEqualStrings("\u{1F468}\u{200D}\u{1F469} ", try stack.render(allocator));
+}
+
 test "layer.LayerStack - reports allocation failure instead of truncating" {
     // The old signature had no way to say an allocation failed, so it returned
     // a short frame — which reaches the screen looking like a rendering bug.

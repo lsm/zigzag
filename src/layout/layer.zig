@@ -116,12 +116,18 @@ pub const LayerStack = struct {
         var col: usize = layer.x;
         var i: usize = 0;
         var current_ansi: []const u8 = "";
+        // The cell this layer painted last on the current row, and where its
+        // bytes start and end in `content`.
+        var last_cell: ?usize = null;
+        var last_start: usize = 0;
+        var last_end: usize = 0;
 
         while (i < content.len and row < h) {
             if (content[i] == '\n') {
                 row += 1;
                 col = layer.x;
                 i += 1;
+                last_cell = null;
                 continue;
             }
 
@@ -143,6 +149,7 @@ pub const LayerStack = struct {
             }
 
             // Decode one UTF-8 character; treat invalid bytes as single cells
+            const start = i;
             const char_len = std.unicode.utf8ByteSequenceLength(content[i]) catch 1;
             const end = @min(i + char_len, content.len);
             const char = content[i..end];
@@ -150,8 +157,19 @@ pub const LayerStack = struct {
             const char_width = measure.charWidth(codepoint);
             i = end;
 
-            // Zero-width characters (e.g. combining marks) get no cell
-            if (char_width == 0) continue;
+            // A zero-width character (combining mark, joiner, variation
+            // selector) belongs to the character before it, so it rides along
+            // in that cell instead of taking one. It is dropped only when there
+            // is no such cell or an escape sequence separates the two.
+            if (char_width == 0) {
+                if (last_cell) |idx| {
+                    if (last_end == start) {
+                        grid[idx].content = content[last_start..end];
+                        last_end = end;
+                    }
+                }
+                continue;
+            }
 
             const is_transparent = layer.transparent and codepoint == ' ' and current_ansi.len == 0;
             if (!is_transparent and col + char_width <= w) {
@@ -159,10 +177,15 @@ pub const LayerStack = struct {
                     .content = char,
                     .ansi_prefix = current_ansi,
                 };
+                last_cell = row * w + col;
+                last_start = start;
+                last_end = end;
                 // A wide character covers the following cell as well
                 if (char_width == 2) {
                     grid[row * w + col + 1] = .{ .content = "" };
                 }
+            } else {
+                last_cell = null;
             }
             col += char_width;
         }
