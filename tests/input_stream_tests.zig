@@ -587,3 +587,62 @@ test "an oversized Alt-prefixed sequence is dropped, not typed" {
     try testing.expectEqual(@as(usize, 1), h.events.items.len);
     try testing.expectEqual(@as(u21, 'd'), h.events.items[0].key.key.char);
 }
+
+test "a dropped CSI past its parameters ends at the next parameter byte" {
+    var h = Harness.init();
+    defer h.deinit();
+
+    var data = std.array_list.Managed(u8).init(testing.allocator);
+    defer data.deinit();
+    try data.appendSlice("\x1b[");
+    try data.appendNTimes('1', InputParser.capacity - 3);
+    try data.append(' ');
+
+    try h.feed(data.items);
+    try h.feed("1a");
+
+    try testing.expectEqual(@as(usize, 2), h.events.items.len);
+    try testing.expectEqual(@as(u21, '1'), h.events.items[0].key.key.char);
+    try testing.expectEqual(@as(u21, 'a'), h.events.items[1].key.key.char);
+}
+
+test "a sequence after a dropped string's split terminator gets its own timeout" {
+    var h = Harness.init();
+    defer h.deinit();
+
+    var data = std.array_list.Managed(u8).init(testing.allocator);
+    defer data.deinit();
+    try data.appendSlice("\x1b]");
+    try data.appendNTimes('A', InputParser.capacity - 3);
+    try data.append(0x1b);
+
+    try h.feed(data.items);
+    try h.idle(100 * ms);
+    try h.feed("\\\x1b[");
+    try h.feed("A");
+
+    try testing.expectEqual(@as(usize, 1), h.events.items.len);
+    try testing.expect(h.events.items[0].key.key == .up);
+}
+
+test "an Alt-prefixed paste longer than the buffer still arrives as paste" {
+    var h = Harness.init();
+    defer h.deinit();
+
+    var data = std.array_list.Managed(u8).init(testing.allocator);
+    defer data.deinit();
+    try data.appendSlice("\x1b\x1b[200~");
+    try data.appendNTimes('p', 6000);
+    try data.appendSlice("\x1b[201~z");
+
+    try h.feed(data.items);
+
+    var pasted: usize = 0;
+    for (h.events.items[0 .. h.events.items.len - 1]) |event| {
+        const text = event.key.key.paste;
+        for (text) |c| try testing.expectEqual(@as(u8, 'p'), c);
+        pasted += text.len;
+    }
+    try testing.expectEqual(@as(usize, 6000), pasted);
+    try testing.expectEqual(@as(u21, 'z'), h.events.items[h.events.items.len - 1].key.key.char);
+}

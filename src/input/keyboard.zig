@@ -180,16 +180,28 @@ const StringTerm = enum { bel_or_st, st_only };
 /// How the tail of an unfinished escape sequence ends, for the sequences
 /// framed by a terminator rather than a fixed length.
 fn discardKind(data: []const u8) ?InputParser.Discard {
-    // Alt-prefixed forms (ESC ESC [ ...) frame like the sequence they wrap.
-    var i: usize = 1;
-    while (i < data.len and data[i] == 0x1b) : (i += 1) {}
-    if (i >= data.len) return null;
-    return switch (data[i]) {
-        '[' => .csi,
+    const at = wrappedStart(data) + 1;
+    if (at >= data.len) return null;
+    return switch (data[at]) {
+        '[' => blk: {
+            // A CSI already past its parameters ends at the next byte that
+            // is not an intermediate, so the phase has to be carried over.
+            var i = at + 1;
+            while (i < data.len and data[i] >= 0x30 and data[i] <= 0x3f) : (i += 1) {}
+            break :blk if (i < data.len and data[i] >= 0x20 and data[i] <= 0x2f) .csi_intermediate else .csi;
+        },
         ']' => .string_bel_or_st,
         'P', '_', '^', 'X' => .string_st,
         else => null,
     };
+}
+
+/// Index of the ESC that starts the sequence an Alt prefix wraps: an
+/// ESC ESC [ ... form frames like the ESC [ ... it carries.
+fn wrappedStart(data: []const u8) usize {
+    var i: usize = 0;
+    while (i + 1 < data.len and data[i + 1] == 0x1b) : (i += 1) {}
+    return i;
 }
 
 /// Skip the tail of a dropped sequence, returning how many bytes of `data`
@@ -197,11 +209,18 @@ fn discardKind(data: []const u8) ?InputParser.Discard {
 fn skipDiscarded(state: *InputParser.Discard, data: []const u8) usize {
     switch (state.*) {
         .none => return 0,
-        .csi => {
+        .csi, .csi_intermediate => {
             var i: usize = 0;
-            while (i < data.len and data[i] >= 0x20 and data[i] <= 0x3f) : (i += 1) {}
+            if (state.* == .csi) {
+                while (i < data.len and data[i] >= 0x30 and data[i] <= 0x3f) : (i += 1) {}
+                if (i < data.len and data[i] >= 0x20 and data[i] <= 0x2f) state.* = .csi_intermediate;
+            }
+            while (i < data.len and data[i] >= 0x20 and data[i] <= 0x2f) : (i += 1) {}
             if (i == data.len) return i;
             state.* = .none;
+            // A final byte ends the sequence. Anything else, including a
+            // parameter after intermediates, means it was cut short, and that
+            // byte starts what follows, as `frameCsi` reads it.
             return if (data[i] >= 0x40 and data[i] <= 0x7e) i + 1 else i;
         },
         .string_bel_or_st, .string_st => {
@@ -619,7 +638,7 @@ pub const InputParser = struct {
     /// still arriving; its bytes are skipped until the sequence ends.
     discarding: Discard = .none,
 
-    const Discard = enum { none, csi, string_bel_or_st, string_st };
+    const Discard = enum { none, csi, csi_intermediate, string_bel_or_st, string_st };
 
     /// Feed one read's worth of bytes and collect the events they complete.
     ///
@@ -691,6 +710,8 @@ pub const InputParser = struct {
             if (self.discarding != .none) {
                 offset += skipDiscarded(&self.discarding, chunk);
                 if (self.discarding != .none) break;
+                // What follows the dropped sequence starts its own timeout.
+                self.holding = false;
                 continue;
             }
 
@@ -720,6 +741,14 @@ pub const InputParser = struct {
                     // and the rest of it skipped as it arrives. A trailing ESC
                     // stays, since it may be the first half of a string's ST.
                     if (offset == 0 and self.len == self.buf.len and chunk[0] == 0x1b) {
+                        // Escape pressed just before pasting arrives as an
+                        // Alt-prefixed paste. It is still a paste, so the
+                        // prefix is dropped and the paste streamed as usual.
+                        const wrapped = wrappedStart(chunk);
+                        if (wrapped > 0 and std.mem.startsWith(u8, chunk[wrapped..], paste_start)) {
+                            offset = wrapped;
+                            continue;
+                        }
                         if (discardKind(chunk)) |kind| {
                             self.discarding = kind;
                             offset = self.len;
