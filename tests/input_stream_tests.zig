@@ -617,7 +617,9 @@ test "a sequence after a dropped string's split terminator gets its own timeout"
     try data.append(0x1b);
 
     try h.feed(data.items);
-    try h.idle(100 * ms);
+    // Time passes with no read in between, so the held ESC is still pending
+    // when the rest of ST arrives with it, and reads as ST.
+    h.now_ns += 100 * ms;
     try h.feed("\\\x1b[");
     try h.feed("A");
 
@@ -645,4 +647,24 @@ test "an Alt-prefixed paste longer than the buffer still arrives as paste" {
     }
     try testing.expectEqual(@as(usize, 6000), pasted);
     try testing.expectEqual(@as(u21, 'z'), h.events.items[h.events.items.len - 1].key.key.char);
+}
+
+test "an escape held at the end of a dropped string is released after the timeout" {
+    var h = Harness.init();
+    defer h.deinit();
+
+    var data = std.array_list.Managed(u8).init(testing.allocator);
+    defer data.deinit();
+    try data.appendSlice("\x1b]");
+    try data.appendNTimes('A', InputParser.capacity - 3);
+    try data.append(0x1b);
+
+    try h.feed(data.items);
+    try h.idle(100 * ms);
+    try h.feed("x");
+
+    try testing.expectEqual(@as(usize, 2), h.events.items.len);
+    try testing.expect(h.events.items[0].key.key == .escape);
+    try testing.expectEqual(@as(u21, 'x'), h.events.items[1].key.key.char);
+    try testing.expect(!h.events.items[1].key.modifiers.alt);
 }

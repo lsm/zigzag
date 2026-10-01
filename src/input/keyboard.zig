@@ -708,6 +708,14 @@ pub const InputParser = struct {
             const chunk = self.buf[offset..self.len];
 
             if (self.discarding != .none) {
+                // An ESC held as a possible start of ST that outlives the
+                // escape timeout was an Escape key: the dropped string ends
+                // there, and the ESC takes the lone-Escape path.
+                const waited = now_ns -| self.holding_since_ns;
+                if (chunk.len == 1 and chunk[0] == 0x1b and self.holding and waited >= self.escape_timeout_ns) {
+                    self.discarding = .none;
+                    continue;
+                }
                 offset += skipDiscarded(&self.discarding, chunk);
                 if (self.discarding != .none) break;
                 // What follows the dropped sequence starts its own timeout.
