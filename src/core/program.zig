@@ -438,7 +438,10 @@ pub fn Program(comptime Model: type) type {
 
             try self.message_queue.popBatch(&batch);
             for (batch.items, 0..) |m, i| {
-                const cmd = try self.dispatchToModel(m);
+                const cmd = self.dispatchToModel(m) catch |err| {
+                    try self.message_queue.requeueFront(batch.items[i + 1 ..]);
+                    return err;
+                };
                 self.processCommand(cmd) catch |err| {
                     try self.message_queue.requeueFront(batch.items[i + 1 ..]);
                     return err;
