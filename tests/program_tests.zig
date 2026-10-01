@@ -152,6 +152,63 @@ test "Program.send accepts messages from background threads" {
     try testing.expectEqual(@as(usize, 256), program.model.update_count);
 }
 
+/// Rejects one kind of message, so a queued batch fails part-way through.
+const RejectingModel = struct {
+    accepted: usize = 0,
+
+    pub const Msg = union(enum) {
+        nop: void,
+        reject: void,
+    };
+
+    pub fn init(_: *RejectingModel, _: *zz.Context) zz.Cmd(Msg) {
+        return .none;
+    }
+
+    pub fn update(self: *RejectingModel, msg: Msg, _: *zz.Context) !zz.Cmd(Msg) {
+        switch (msg) {
+            .nop => self.accepted += 1,
+            .reject => return error.Rejected,
+        }
+        return .none;
+    }
+
+    pub fn view(_: *const RejectingModel, _: *const zz.Context) []const u8 {
+        return "";
+    }
+};
+
+fn pushRejectingBatch(program: *zz.Program(RejectingModel)) void {
+    program.send(.{ .nop = {} }) catch unreachable;
+    program.send(.{ .reject = {} }) catch unreachable;
+    program.send(.{ .nop = {} }) catch unreachable;
+    program.send(.{ .nop = {} }) catch unreachable;
+}
+
+test "a failing update leaves the rest of the queued batch for the next drain" {
+    var env_map: std.process.Environ.Map = .init(testing.allocator);
+    defer env_map.deinit();
+
+    var program = zz.Program(RejectingModel).init(
+        testing.allocator,
+        testing.io,
+        &env_map,
+    );
+    defer program.deinit();
+
+    program.model = .{};
+    program.context.allocator = program.arena.allocator();
+
+    const thread = try std.Thread.spawn(.{}, pushRejectingBatch, .{&program});
+    thread.join();
+
+    try testing.expectError(error.Rejected, program.drainMessageQueue());
+    try testing.expectEqual(@as(usize, 1), program.model.accepted);
+
+    try program.drainMessageQueue();
+    try testing.expectEqual(@as(usize, 3), program.model.accepted);
+}
+
 test "Program.send dispatches same-thread frame-backed payloads immediately" {
     var env_map: std.process.Environ.Map = .init(testing.allocator);
     defer env_map.deinit();
