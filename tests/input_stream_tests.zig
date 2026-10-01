@@ -649,7 +649,7 @@ test "an Alt-prefixed paste longer than the buffer still arrives as paste" {
     try testing.expectEqual(@as(u21, 'z'), h.events.items[h.events.items.len - 1].key.key.char);
 }
 
-test "an escape held at the end of a dropped string is released after the timeout" {
+test "an escape held at the end of a dropped string becomes Escape when a key follows after the timeout" {
     var h = Harness.init();
     defer h.deinit();
 
@@ -667,4 +667,22 @@ test "an escape held at the end of a dropped string is released after the timeou
     try testing.expect(h.events.items[0].key.key == .escape);
     try testing.expectEqual(@as(u21, 'x'), h.events.items[1].key.key.char);
     try testing.expect(!h.events.items[1].key.modifiers.alt);
+}
+
+test "a late terminator still ends a dropped string without an Escape" {
+    var h = Harness.init();
+    defer h.deinit();
+
+    var data = std.array_list.Managed(u8).init(testing.allocator);
+    defer data.deinit();
+    try data.appendSlice("\x1b]");
+    try data.appendNTimes('A', InputParser.capacity - 3);
+    try data.append(0x1b);
+
+    try h.feed(data.items);
+    try h.idle(100 * ms);
+    try h.feed("\\y");
+
+    try testing.expectEqual(@as(usize, 1), h.events.items.len);
+    try testing.expectEqual(@as(u21, 'y'), h.events.items[0].key.key.char);
 }
