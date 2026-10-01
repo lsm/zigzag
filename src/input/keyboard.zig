@@ -177,6 +177,73 @@ fn frameCsi(data: []const u8) Frame {
 
 const StringTerm = enum { bel_or_st, st_only };
 
+/// How the tail of an unfinished escape sequence ends, for the sequences
+/// framed by a terminator rather than a fixed length.
+fn discardKind(data: []const u8) ?InputParser.Discard {
+    const at = wrappedStart(data) + 1;
+    if (at >= data.len) return null;
+    return switch (data[at]) {
+        '[' => blk: {
+            // A CSI already past its parameters ends at the next byte that
+            // is not an intermediate, so the phase has to be carried over.
+            var i = at + 1;
+            while (i < data.len and data[i] >= 0x30 and data[i] <= 0x3f) : (i += 1) {}
+            break :blk if (i < data.len and data[i] >= 0x20 and data[i] <= 0x2f) .csi_intermediate else .csi;
+        },
+        ']' => .string_bel_or_st,
+        'P', '_', '^', 'X' => .string_st,
+        else => null,
+    };
+}
+
+/// Index of the ESC that starts the sequence an Alt prefix wraps: an
+/// ESC ESC [ ... form frames like the ESC [ ... it carries.
+fn wrappedStart(data: []const u8) usize {
+    var i: usize = 0;
+    while (i + 1 < data.len and data[i + 1] == 0x1b) : (i += 1) {}
+    return i;
+}
+
+/// Skip the tail of a dropped sequence, returning how many bytes of `data`
+/// belong to it and clearing `state` once its terminator has gone by.
+fn skipDiscarded(state: *InputParser.Discard, data: []const u8) usize {
+    switch (state.*) {
+        .none => return 0,
+        .csi, .csi_intermediate => {
+            var i: usize = 0;
+            if (state.* == .csi) {
+                while (i < data.len and data[i] >= 0x30 and data[i] <= 0x3f) : (i += 1) {}
+                if (i < data.len and data[i] >= 0x20 and data[i] <= 0x2f) state.* = .csi_intermediate;
+            }
+            while (i < data.len and data[i] >= 0x20 and data[i] <= 0x2f) : (i += 1) {}
+            if (i == data.len) return i;
+            state.* = .none;
+            // A final byte ends the sequence. Anything else, including a
+            // parameter after intermediates, means it was cut short, and that
+            // byte starts what follows, as `frameCsi` reads it.
+            return if (data[i] >= 0x40 and data[i] <= 0x7e) i + 1 else i;
+        },
+        .string_bel_or_st, .string_st => {
+            var i: usize = 0;
+            while (i < data.len) : (i += 1) {
+                if (data[i] == 0x07 and state.* == .string_bel_or_st) {
+                    state.* = .none;
+                    return i + 1;
+                }
+                if (data[i] == 0x1b) {
+                    // An ESC at the very end may be the first half of ST.
+                    if (i + 1 == data.len) return i;
+                    state.* = .none;
+                    // ST ends the string; any other ESC aborts it and starts
+                    // the next event, as `frameString` reads it.
+                    return if (data[i + 1] == '\\') i + 2 else i;
+                }
+            }
+            return i;
+        },
+    }
+}
+
 /// OSC/DCS/APC/PM/SOS strings run until ST (ESC \), and OSC also until BEL.
 fn frameString(data: []const u8, term: StringTerm) Frame {
     var i: usize = 2;
@@ -567,6 +634,11 @@ pub const InputParser = struct {
     holding_since_ns: u64 = 0,
     /// How long a partial sequence waits before being read as a bare Escape.
     escape_timeout_ns: u64 = default_escape_timeout_ns,
+    /// Set while the tail of an escape sequence too long for the buffer is
+    /// still arriving; its bytes are skipped until the sequence ends.
+    discarding: Discard = .none,
+
+    const Discard = enum { none, csi, csi_intermediate, string_bel_or_st, string_st };
 
     /// Feed one read's worth of bytes and collect the events they complete.
     ///
@@ -615,6 +687,7 @@ pub const InputParser = struct {
     pub fn reset(self: *InputParser) void {
         self.clearBuffer();
         self.in_paste = false;
+        self.discarding = .none;
     }
 
     fn clearBuffer(self: *InputParser) void {
@@ -633,6 +706,22 @@ pub const InputParser = struct {
 
         while (offset < self.len) {
             const chunk = self.buf[offset..self.len];
+
+            if (self.discarding != .none) {
+                // An ESC held as a possible start of ST that outlives the
+                // escape timeout was an Escape key: the dropped string ends
+                // there, and the ESC takes the lone-Escape path.
+                const waited = now_ns -| self.holding_since_ns;
+                if (chunk.len == 1 and chunk[0] == 0x1b and self.holding and waited >= self.escape_timeout_ns) {
+                    self.discarding = .none;
+                    continue;
+                }
+                offset += skipDiscarded(&self.discarding, chunk);
+                if (self.discarding != .none) break;
+                // What follows the dropped sequence starts its own timeout.
+                self.holding = false;
+                continue;
+            }
 
             if (self.in_paste) {
                 const consumed = try self.drainPaste(allocator, results, chunk, force);
@@ -654,9 +743,35 @@ pub const InputParser = struct {
                     offset += parsed.consumed;
                 },
                 .incomplete => {
+                    // An escape sequence filling the whole buffer can never
+                    // complete here: replaying it would read as Escape
+                    // followed by its payload typed as text, so it is dropped
+                    // and the rest of it skipped as it arrives. A trailing ESC
+                    // stays, since it may be the first half of a string's ST.
+                    if (offset == 0 and self.len == self.buf.len and chunk[0] == 0x1b) {
+                        // Escape pressed just before pasting arrives as an
+                        // Alt-prefixed paste. It is still a paste, so the
+                        // prefix is dropped and the paste streamed as usual.
+                        const wrapped = wrappedStart(chunk);
+                        if (wrapped > 0 and std.mem.startsWith(u8, chunk[wrapped..], paste_start)) {
+                            offset = wrapped;
+                            continue;
+                        }
+                        if (discardKind(chunk)) |kind| {
+                            self.discarding = kind;
+                            offset = self.len;
+                            if (kind != .csi and chunk[chunk.len - 1] == 0x1b) offset -= 1;
+                            break;
+                        }
+                    }
+
                     const waited = now_ns -| self.holding_since_ns;
                     const timed_out = self.holding and waited >= self.escape_timeout_ns;
                     if (!force and !timed_out) break;
+
+                    // Started mid-buffer, it is moved to the front to make
+                    // room for the rest instead of being flushed.
+                    if (force and offset > 0 and chunk[0] == 0x1b) break;
 
                     const parsed = parseFlush(chunk);
                     if (parsed.consumed == 0) break;
