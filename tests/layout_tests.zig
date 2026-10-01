@@ -236,7 +236,7 @@ test "layer.LayerStack - a combining mark stays with its base character" {
     try testing.expectEqualStrings("e\u{301}x  ", try stack.render(allocator));
 }
 
-test "layer.LayerStack - a joiner keeps an emoji sequence contiguous" {
+test "layer.LayerStack - a joiner is dropped so an emoji sequence keeps its measured columns" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -247,7 +247,7 @@ test "layer.LayerStack - a joiner keeps an emoji sequence contiguous" {
 
     try stack.push(.{ .content = "\u{1F468}\u{200D}\u{1F469}", .transparent = false });
 
-    try testing.expectEqualStrings("\u{1F468}\u{200D}\u{1F469} ", try stack.render(allocator));
+    try testing.expectEqualStrings("\u{1F468}\u{1F469} ", try stack.render(allocator));
 }
 
 test "layer.LayerStack - an overlay on the first half of a wide character blanks the second" {
@@ -278,6 +278,52 @@ test "layer.LayerStack - an overlay on the second half of a wide character blank
     try stack.push(.{ .content = "x", .x = 1, .z = 1 });
 
     try testing.expectEqualStrings(" xA", try stack.render(allocator));
+}
+
+test "layer.LayerStack - control characters never reach the output" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var stack = zz.layout.layer.LayerStack.init(allocator);
+    defer stack.deinit();
+    stack.setSize(3, 1);
+
+    try stack.push(.{ .content = "a\r\x07b", .transparent = false });
+
+    try testing.expectEqualStrings("ab ", try stack.render(allocator));
+}
+
+test "layer.LayerStack - erasing a wide glyph's second half reveals the layer beneath" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var stack = zz.layout.layer.LayerStack.init(allocator);
+    defer stack.deinit();
+    stack.setSize(2, 1);
+
+    try stack.push(.{ .content = "AB", .z = 0, .transparent = false });
+    try stack.push(.{ .content = "\u{6F22}", .z = 1 });
+    try stack.push(.{ .content = "x", .x = 0, .z = 2 });
+
+    try testing.expectEqualStrings("xB", try stack.render(allocator));
+}
+
+test "layer.LayerStack - erasing a wide glyph's first half reveals the layer beneath" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var stack = zz.layout.layer.LayerStack.init(allocator);
+    defer stack.deinit();
+    stack.setSize(2, 1);
+
+    try stack.push(.{ .content = "AB", .z = 0, .transparent = false });
+    try stack.push(.{ .content = "\u{6F22}", .z = 1 });
+    try stack.push(.{ .content = "x", .x = 1, .z = 2 });
+
+    try testing.expectEqualStrings("Ax", try stack.render(allocator));
 }
 
 test "layer.LayerStack - reports allocation failure instead of truncating" {

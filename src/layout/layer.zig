@@ -5,6 +5,7 @@
 const std = @import("std");
 const Writer = std.Io.Writer;
 const measure = @import("measure.zig");
+const unicode = @import("../unicode.zig");
 
 /// A single layer in the stack.
 pub const Layer = struct {
@@ -72,6 +73,10 @@ pub const LayerStack = struct {
         for (grid) |*cell| {
             cell.* = background;
         }
+        // What each cell showed before the glyph now in it was painted, so
+        // erasing half of a wide glyph can reveal the layer beneath it.
+        const under = try allocator.alloc(Cell, w * h);
+        @memset(under, background);
 
         // Sort layers by z-index
         const sorted = try allocator.alloc(Layer, self.layers.items.len);
@@ -84,7 +89,7 @@ pub const LayerStack = struct {
 
         // Paint each layer onto the grid
         for (sorted) |layer| {
-            paintLayer(grid, w, h, layer, background);
+            paintLayer(grid, under, w, h, layer, background);
         }
 
         // Render grid to string
@@ -110,7 +115,7 @@ pub const LayerStack = struct {
         return result.toArrayList().items;
     }
 
-    fn paintLayer(grid: []Cell, w: usize, h: usize, layer: Layer, background: Cell) void {
+    fn paintLayer(grid: []Cell, under: []Cell, w: usize, h: usize, layer: Layer, background: Cell) void {
         const content = layer.content;
         var row: usize = layer.y;
         var col: usize = layer.x;
@@ -157,15 +162,19 @@ pub const LayerStack = struct {
             const char_width = measure.charWidth(codepoint);
             i = end;
 
-            // A zero-width character (combining mark, joiner, variation
-            // selector) belongs to the character before it, so it rides along
-            // in that cell instead of taking one. It is dropped only when there
-            // is no such cell or an escape sequence separates the two.
+            // A zero-width mark (a combining accent, say) belongs to the
+            // character before it, so it rides along in that cell instead of
+            // taking one. Controls are dropped, and so are the joiner and the
+            // emoji presentation selectors: those make a terminal draw a
+            // cluster narrower or wider than the per-code-point width every
+            // layout here measures, which would shift the rest of the row.
             if (char_width == 0) {
-                if (last_cell) |idx| {
-                    if (last_end == start) {
-                        grid[idx].content = content[last_start..end];
-                        last_end = end;
+                if (attachesToPrevious(codepoint)) {
+                    if (last_cell) |idx| {
+                        if (last_end == start) {
+                            grid[idx].content = content[last_start..end];
+                            last_end = end;
+                        }
                     }
                 }
                 continue;
@@ -175,8 +184,9 @@ pub const LayerStack = struct {
             if (!is_transparent and col + char_width <= w) {
                 const first = row * w + col;
                 // Landing on the second half of a wide character below leaves
-                // its first half unable to draw; blank it.
-                if (col > 0 and grid[first].content.len == 0) grid[first - 1] = background;
+                // its first half unable to draw; show what it covered instead.
+                if (col > 0 and grid[first].content.len == 0) grid[first - 1] = revealed(under[first - 1], background);
+                under[first] = grid[first];
                 grid[first] = .{
                     .content = char,
                     .ansi_prefix = current_ansi,
@@ -186,12 +196,14 @@ pub const LayerStack = struct {
                 last_end = end;
                 // A wide character covers the following cell as well
                 if (char_width == 2) {
+                    under[first + 1] = grid[first + 1];
                     grid[first + 1] = .{ .content = "" };
                 }
                 // Covering the first half of a wide character below orphans
-                // its second half, which would otherwise draw nothing; blank it.
+                // its second half, which would otherwise draw nothing; show
+                // what it covered instead.
                 if (col + char_width < w and grid[first + char_width].content.len == 0) {
-                    grid[first + char_width] = background;
+                    grid[first + char_width] = revealed(under[first + char_width], background);
                 }
             } else {
                 last_cell = null;
@@ -200,6 +212,26 @@ pub const LayerStack = struct {
         }
     }
 };
+
+/// Whether a zero-width code point can share the cell of the character before
+/// it without changing how wide the terminal draws that cell.
+fn attachesToPrevious(codepoint: u21) bool {
+    if (unicode.codepointWidth(codepoint) != 0) return false;
+    return switch (codepoint) {
+        0x200D, 0xFE0E, 0xFE0F => false,
+        else => true,
+    };
+}
+
+/// The cell to show where half of a wide glyph was erased: what that half
+/// covered, unless that is itself part of a wide glyph, which cannot draw in
+/// one column.
+fn revealed(cell: Cell, background: Cell) Cell {
+    if (cell.content.len == 0) return background;
+    const len = std.unicode.utf8ByteSequenceLength(cell.content[0]) catch 1;
+    const codepoint: u21 = std.unicode.utf8Decode(cell.content[0..@min(len, cell.content.len)]) catch cell.content[0];
+    return if (measure.charWidth(codepoint) == 1) cell else background;
+}
 
 const Cell = struct {
     /// UTF-8 bytes of the character in this cell.
