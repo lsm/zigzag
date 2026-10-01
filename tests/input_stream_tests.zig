@@ -521,3 +521,69 @@ test "a sequence straddling a full buffer is completed, not dropped" {
     try testing.expectEqual(InputParser.capacity - 1, h.events.items.len);
     try testing.expect(h.events.items[h.events.items.len - 1].key.key == .up);
 }
+
+test "an oversized string aborted by a bare escape lets the next event through" {
+    var h = Harness.init();
+    defer h.deinit();
+
+    var data = std.array_list.Managed(u8).init(testing.allocator);
+    defer data.deinit();
+    try data.appendSlice("\x1b]");
+    try data.appendNTimes('A', 6000);
+    try data.appendSlice("\x1b[Ab");
+
+    try h.feed(data.items);
+
+    try testing.expectEqual(@as(usize, 2), h.events.items.len);
+    try testing.expect(h.events.items[0].key.key == .up);
+    try testing.expectEqual(@as(u21, 'b'), h.events.items[1].key.key.char);
+}
+
+test "a string terminator split at the buffer edge still ends a dropped string" {
+    var h = Harness.init();
+    defer h.deinit();
+
+    var data = std.array_list.Managed(u8).init(testing.allocator);
+    defer data.deinit();
+    try data.appendSlice("\x1b]");
+    try data.appendNTimes('A', InputParser.capacity - 3);
+    try data.appendSlice("\x1b\\b");
+
+    try h.feed(data.items);
+
+    try testing.expectEqual(@as(usize, 1), h.events.items.len);
+    try testing.expectEqual(@as(u21, 'b'), h.events.items[0].key.key.char);
+}
+
+test "a sequence filling the buffer exactly is dropped before the escape timeout" {
+    var h = Harness.init();
+    defer h.deinit();
+
+    var data = std.array_list.Managed(u8).init(testing.allocator);
+    defer data.deinit();
+    try data.appendSlice("\x1b[");
+    try data.appendNTimes('1', InputParser.capacity - 2);
+
+    try h.feed(data.items);
+    try h.idle(100 * ms);
+    try h.feed("uc");
+
+    try testing.expectEqual(@as(usize, 1), h.events.items.len);
+    try testing.expectEqual(@as(u21, 'c'), h.events.items[0].key.key.char);
+}
+
+test "an oversized Alt-prefixed sequence is dropped, not typed" {
+    var h = Harness.init();
+    defer h.deinit();
+
+    var data = std.array_list.Managed(u8).init(testing.allocator);
+    defer data.deinit();
+    try data.appendSlice("\x1b\x1b[");
+    for (0..3000) |_| try data.appendSlice("1;");
+    try data.appendSlice("ud");
+
+    try h.feed(data.items);
+
+    try testing.expectEqual(@as(usize, 1), h.events.items.len);
+    try testing.expectEqual(@as(u21, 'd'), h.events.items[0].key.key.char);
+}

@@ -180,8 +180,11 @@ const StringTerm = enum { bel_or_st, st_only };
 /// How the tail of an unfinished escape sequence ends, for the sequences
 /// framed by a terminator rather than a fixed length.
 fn discardKind(data: []const u8) ?InputParser.Discard {
-    if (data.len < 2) return null;
-    return switch (data[1]) {
+    // Alt-prefixed forms (ESC ESC [ ...) frame like the sequence they wrap.
+    var i: usize = 1;
+    while (i < data.len and data[i] == 0x1b) : (i += 1) {}
+    if (i >= data.len) return null;
+    return switch (data[i]) {
         '[' => .csi,
         ']' => .string_bel_or_st,
         'P', '_', '^', 'X' => .string_st,
@@ -211,10 +214,10 @@ fn skipDiscarded(state: *InputParser.Discard, data: []const u8) usize {
                 if (data[i] == 0x1b) {
                     // An ESC at the very end may be the first half of ST.
                     if (i + 1 == data.len) return i;
-                    if (data[i + 1] == '\\') {
-                        state.* = .none;
-                        return i + 2;
-                    }
+                    state.* = .none;
+                    // ST ends the string; any other ESC aborts it and starts
+                    // the next event, as `frameString` reads it.
+                    return if (data[i + 1] == '\\') i + 2 else i;
                 }
             }
             return i;
@@ -711,24 +714,27 @@ pub const InputParser = struct {
                     offset += parsed.consumed;
                 },
                 .incomplete => {
+                    // An escape sequence filling the whole buffer can never
+                    // complete here: replaying it would read as Escape
+                    // followed by its payload typed as text, so it is dropped
+                    // and the rest of it skipped as it arrives. A trailing ESC
+                    // stays, since it may be the first half of a string's ST.
+                    if (offset == 0 and self.len == self.buf.len and chunk[0] == 0x1b) {
+                        if (discardKind(chunk)) |kind| {
+                            self.discarding = kind;
+                            offset = self.len;
+                            if (kind != .csi and chunk[chunk.len - 1] == 0x1b) offset -= 1;
+                            break;
+                        }
+                    }
+
                     const waited = now_ns -| self.holding_since_ns;
                     const timed_out = self.holding and waited >= self.escape_timeout_ns;
                     if (!force and !timed_out) break;
 
-                    // The buffer filled while an escape sequence was still
-                    // open. Started mid-buffer, it is moved to the front to
-                    // make room for the rest. Filling the whole buffer, it can
-                    // never complete here: replaying it would read as Escape
-                    // followed by its payload typed as text, so it is dropped
-                    // and the rest of it skipped as it arrives.
-                    if (force and chunk[0] == 0x1b) {
-                        if (offset > 0) break;
-                        if (discardKind(chunk)) |kind| {
-                            self.discarding = kind;
-                            offset = self.len;
-                            break;
-                        }
-                    }
+                    // Started mid-buffer, it is moved to the front to make
+                    // room for the rest instead of being flushed.
+                    if (force and offset > 0 and chunk[0] == 0x1b) break;
 
                     const parsed = parseFlush(chunk);
                     if (parsed.consumed == 0) break;
