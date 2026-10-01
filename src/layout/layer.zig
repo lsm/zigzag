@@ -5,6 +5,7 @@
 const std = @import("std");
 const Writer = std.Io.Writer;
 const measure = @import("measure.zig");
+const unicode = @import("../unicode.zig");
 
 /// A single layer in the stack.
 pub const Layer = struct {
@@ -62,15 +63,8 @@ pub const LayerStack = struct {
         const w: usize = self.width;
         const h: usize = self.height;
 
-        // Create cell buffer: each cell stores a byte slice (content) and ANSI state
-        // For simplicity, we use a 2D grid of cells that stores display characters
-        const grid = try allocator.alloc(Cell, w * h);
-
-        // Fill with background
         const bg = [1]u8{self.background};
-        for (grid) |*cell| {
-            cell.* = .{ .content = &bg, .ansi_prefix = "" };
-        }
+        const background: Cell = .{ .content = &bg, .ansi_prefix = "" };
 
         // Sort layers by z-index
         const sorted = try allocator.alloc(Layer, self.layers.items.len);
@@ -81,9 +75,43 @@ pub const LayerStack = struct {
             }
         }.lessThan);
 
-        // Paint each layer onto the grid
-        for (sorted) |layer| {
-            self.paintLayer(grid, w, h, layer);
+        // Each layer paints onto its own plane; a null cell is one the layer
+        // leaves showing through.
+        const cells = w * h;
+        const planes = try allocator.alloc(?Cell, sorted.len * cells);
+        @memset(planes, null);
+        for (sorted, 0..) |layer, index| {
+            try paintLayer(allocator, planes[index * cells ..][0..cells], w, h, layer);
+        }
+
+        // Composite from the top down. A glyph shows only when no visible
+        // glyph above it covers any of its columns; one that is partly
+        // covered shows nowhere, so the layers beneath show through all of
+        // its columns, however deep the stack.
+        const grid = try allocator.alloc(Cell, cells);
+        @memset(grid, background);
+        const covered = try allocator.alloc(bool, cells);
+        @memset(covered, false);
+        var index = sorted.len;
+        while (index > 0) {
+            index -= 1;
+            const plane = planes[index * cells ..][0..cells];
+            for (0..h) |row| {
+                for (0..w) |col| {
+                    const at = row * w + col;
+                    const cell = plane[at] orelse continue;
+                    // The second column of a wide glyph goes with its first.
+                    if (cell.content.len == 0) continue;
+                    const wide = col + 1 < w and plane[at + 1] != null and plane[at + 1].?.content.len == 0;
+                    if (covered[at] or (wide and covered[at + 1])) continue;
+                    grid[at] = cell;
+                    covered[at] = true;
+                    if (wide) {
+                        grid[at + 1] = .{ .content = "" };
+                        covered[at + 1] = true;
+                    }
+                }
+            }
         }
 
         // Render grid to string
@@ -96,7 +124,8 @@ pub const LayerStack = struct {
                 const cell = grid[row * w + col];
                 // Empty content marks the second column of a wide character
                 if (cell.content.len == 0) continue;
-                if (cell.ansi_prefix.len > 0) {
+                // A mark styled apart from its base carries its own escape.
+                if (cell.ansi_prefix.len > 0 or std.mem.indexOfScalar(u8, cell.content, 0x1b) != null) {
                     try writer.writeAll(cell.ansi_prefix);
                     try writer.writeAll(cell.content);
                     try writer.writeAll("\x1b[0m");
@@ -109,19 +138,28 @@ pub const LayerStack = struct {
         return result.toArrayList().items;
     }
 
-    fn paintLayer(self: *const LayerStack, grid: []Cell, w: usize, h: usize, layer: Layer) void {
-        _ = self;
+    fn paintLayer(allocator: std.mem.Allocator, plane: []?Cell, w: usize, h: usize, layer: Layer) !void {
         const content = layer.content;
         var row: usize = layer.y;
         var col: usize = layer.x;
         var i: usize = 0;
         var current_ansi: []const u8 = "";
+        // The cell this layer painted last on the current row, where its
+        // bytes start and end in `content`, and whether its text is still that
+        // one slice of `content`.
+        var last_cell: ?usize = null;
+        var last_start: usize = 0;
+        var last_end: usize = 0;
+        var last_sliced = true;
+        // The style in effect at the end of that cell's text.
+        var last_style: []const u8 = "";
 
         while (i < content.len and row < h) {
             if (content[i] == '\n') {
                 row += 1;
                 col = layer.x;
                 i += 1;
+                last_cell = null;
                 continue;
             }
 
@@ -143,6 +181,7 @@ pub const LayerStack = struct {
             }
 
             // Decode one UTF-8 character; treat invalid bytes as single cells
+            const start = i;
             const char_len = std.unicode.utf8ByteSequenceLength(content[i]) catch 1;
             const end = @min(i + char_len, content.len);
             const char = content[i..end];
@@ -150,24 +189,71 @@ pub const LayerStack = struct {
             const char_width = measure.charWidth(codepoint);
             i = end;
 
-            // Zero-width characters (e.g. combining marks) get no cell
-            if (char_width == 0) continue;
+            // A zero-width mark (a combining accent, say) belongs to the
+            // character before it, so it rides along in that cell instead of
+            // taking one. Controls are dropped, and so are the joiner and the
+            // emoji presentation selectors: those make a terminal draw a
+            // cluster narrower or wider than the per-code-point width every
+            // layout here measures, which would shift the rest of the row.
+            // A style escape between the two takes no column, so the mark
+            // still joins the cell, copied onto its text when the bytes are
+            // not adjacent, and switching to the mark's own style if that
+            // differs from the style the cell's text ends in.
+            if (char_width == 0) {
+                if (attachesToPrevious(codepoint)) {
+                    if (last_cell) |at| {
+                        const restyle = !std.mem.eql(u8, current_ansi, last_style);
+                        if (last_sliced and last_end == start and !restyle) {
+                            plane[at].?.content = content[last_start..end];
+                        } else if (restyle) {
+                            plane[at].?.content = try std.mem.concat(allocator, u8, &.{ plane[at].?.content, "\x1b[0m", current_ansi, char });
+                            last_style = current_ansi;
+                            last_sliced = false;
+                        } else {
+                            plane[at].?.content = try std.mem.concat(allocator, u8, &.{ plane[at].?.content, char });
+                            last_sliced = false;
+                        }
+                        last_end = end;
+                    }
+                }
+                continue;
+            }
 
             const is_transparent = layer.transparent and codepoint == ' ' and current_ansi.len == 0;
             if (!is_transparent and col + char_width <= w) {
-                grid[row * w + col] = .{
+                const at = row * w + col;
+                plane[at] = .{
                     .content = char,
                     .ansi_prefix = current_ansi,
                 };
+                last_cell = at;
+                last_start = start;
+                last_end = end;
+                last_sliced = true;
+                last_style = current_ansi;
                 // A wide character covers the following cell as well
                 if (char_width == 2) {
-                    grid[row * w + col + 1] = .{ .content = "" };
+                    plane[at + 1] = .{ .content = "" };
                 }
+            } else {
+                last_cell = null;
             }
             col += char_width;
         }
     }
 };
+
+/// Whether a zero-width code point can share the cell of the character before
+/// it without changing how wide the terminal draws that cell.
+fn attachesToPrevious(codepoint: u21) bool {
+    if (unicode.codepointWidth(codepoint) != 0) return false;
+    return switch (codepoint) {
+        // Zero-width joiner, text and emoji presentation selectors, and the
+        // enclosing keycap, which turns `1` into a two-column keycap.
+        0x200D, 0xFE0E, 0xFE0F, 0x20E3 => false,
+        else => true,
+    };
+}
 
 const Cell = struct {
     /// UTF-8 bytes of the character in this cell.
