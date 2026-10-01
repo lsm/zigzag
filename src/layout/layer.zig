@@ -63,20 +63,8 @@ pub const LayerStack = struct {
         const w: usize = self.width;
         const h: usize = self.height;
 
-        // Create cell buffer: each cell stores a byte slice (content) and ANSI state
-        // For simplicity, we use a 2D grid of cells that stores display characters
-        const grid = try allocator.alloc(Cell, w * h);
-
-        // Fill with background
         const bg = [1]u8{self.background};
         const background: Cell = .{ .content = &bg, .ansi_prefix = "" };
-        for (grid) |*cell| {
-            cell.* = background;
-        }
-        // What each cell showed before the glyph now in it was painted, so
-        // erasing half of a wide glyph can reveal the layer beneath it.
-        const under = try allocator.alloc(Cell, w * h);
-        @memset(under, background);
 
         // Sort layers by z-index
         const sorted = try allocator.alloc(Layer, self.layers.items.len);
@@ -87,9 +75,43 @@ pub const LayerStack = struct {
             }
         }.lessThan);
 
-        // Paint each layer onto the grid
-        for (sorted) |layer| {
-            paintLayer(grid, under, w, h, layer, background);
+        // Each layer paints onto its own plane; a null cell is one the layer
+        // leaves showing through.
+        const cells = w * h;
+        const planes = try allocator.alloc(?Cell, sorted.len * cells);
+        @memset(planes, null);
+        for (sorted, 0..) |layer, index| {
+            paintLayer(planes[index * cells ..][0..cells], w, h, layer);
+        }
+
+        // Composite from the top down. A glyph shows only when no visible
+        // glyph above it covers any of its columns; one that is partly
+        // covered shows nowhere, so the layers beneath show through all of
+        // its columns, however deep the stack.
+        const grid = try allocator.alloc(Cell, cells);
+        @memset(grid, background);
+        const covered = try allocator.alloc(bool, cells);
+        @memset(covered, false);
+        var index = sorted.len;
+        while (index > 0) {
+            index -= 1;
+            const plane = planes[index * cells ..][0..cells];
+            for (0..h) |row| {
+                for (0..w) |col| {
+                    const at = row * w + col;
+                    const cell = plane[at] orelse continue;
+                    // The second column of a wide glyph goes with its first.
+                    if (cell.content.len == 0) continue;
+                    const wide = col + 1 < w and plane[at + 1] != null and plane[at + 1].?.content.len == 0;
+                    if (covered[at] or (wide and covered[at + 1])) continue;
+                    grid[at] = cell;
+                    covered[at] = true;
+                    if (wide) {
+                        grid[at + 1] = .{ .content = "" };
+                        covered[at + 1] = true;
+                    }
+                }
+            }
         }
 
         // Render grid to string
@@ -115,7 +137,7 @@ pub const LayerStack = struct {
         return result.toArrayList().items;
     }
 
-    fn paintLayer(grid: []Cell, under: []Cell, w: usize, h: usize, layer: Layer, background: Cell) void {
+    fn paintLayer(plane: []?Cell, w: usize, h: usize, layer: Layer) void {
         const content = layer.content;
         var row: usize = layer.y;
         var col: usize = layer.x;
@@ -170,9 +192,9 @@ pub const LayerStack = struct {
             // layout here measures, which would shift the rest of the row.
             if (char_width == 0) {
                 if (attachesToPrevious(codepoint)) {
-                    if (last_cell) |idx| {
+                    if (last_cell) |at| {
                         if (last_end == start) {
-                            grid[idx].content = content[last_start..end];
+                            plane[at].?.content = content[last_start..end];
                             last_end = end;
                         }
                     }
@@ -182,28 +204,17 @@ pub const LayerStack = struct {
 
             const is_transparent = layer.transparent and codepoint == ' ' and current_ansi.len == 0;
             if (!is_transparent and col + char_width <= w) {
-                const first = row * w + col;
-                // Landing on the second half of a wide character below leaves
-                // its first half unable to draw; show what it covered instead.
-                if (col > 0 and grid[first].content.len == 0) grid[first - 1] = revealed(under[first - 1], background);
-                under[first] = grid[first];
-                grid[first] = .{
+                const at = row * w + col;
+                plane[at] = .{
                     .content = char,
                     .ansi_prefix = current_ansi,
                 };
-                last_cell = first;
+                last_cell = at;
                 last_start = start;
                 last_end = end;
                 // A wide character covers the following cell as well
                 if (char_width == 2) {
-                    under[first + 1] = grid[first + 1];
-                    grid[first + 1] = .{ .content = "" };
-                }
-                // Covering the first half of a wide character below orphans
-                // its second half, which would otherwise draw nothing; show
-                // what it covered instead.
-                if (col + char_width < w and grid[first + char_width].content.len == 0) {
-                    grid[first + char_width] = revealed(under[first + char_width], background);
+                    plane[at + 1] = .{ .content = "" };
                 }
             } else {
                 last_cell = null;
@@ -221,16 +232,6 @@ fn attachesToPrevious(codepoint: u21) bool {
         0x200D, 0xFE0E, 0xFE0F => false,
         else => true,
     };
-}
-
-/// The cell to show where half of a wide glyph was erased: what that half
-/// covered, unless that is itself part of a wide glyph, which cannot draw in
-/// one column.
-fn revealed(cell: Cell, background: Cell) Cell {
-    if (cell.content.len == 0) return background;
-    const len = std.unicode.utf8ByteSequenceLength(cell.content[0]) catch 1;
-    const codepoint: u21 = std.unicode.utf8Decode(cell.content[0..@min(len, cell.content.len)]) catch cell.content[0];
-    return if (measure.charWidth(codepoint) == 1) cell else background;
 }
 
 const Cell = struct {

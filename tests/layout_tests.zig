@@ -326,6 +326,23 @@ test "layer.LayerStack - erasing a wide glyph's first half reveals the layer ben
     try testing.expectEqualStrings("Ax", try stack.render(allocator));
 }
 
+test "layer.LayerStack - a top layer reveals the base through nested wide glyphs" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var stack = zz.layout.layer.LayerStack.init(allocator);
+    defer stack.deinit();
+    stack.setSize(2, 1);
+
+    try stack.push(.{ .content = "AB", .z = 0, .transparent = false });
+    try stack.push(.{ .content = "\u{6F22}", .z = 1 });
+    try stack.push(.{ .content = "\u{754C}", .z = 2 });
+    try stack.push(.{ .content = "x", .x = 0, .z = 3 });
+
+    try testing.expectEqualStrings("xB", try stack.render(allocator));
+}
+
 test "layer.LayerStack - reports allocation failure instead of truncating" {
     // The old signature had no way to say an allocation failed, so it returned
     // a short frame — which reaches the screen looking like a rendering bug.
