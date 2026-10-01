@@ -68,8 +68,9 @@ pub const LayerStack = struct {
 
         // Fill with background
         const bg = [1]u8{self.background};
+        const background: Cell = .{ .content = &bg, .ansi_prefix = "" };
         for (grid) |*cell| {
-            cell.* = .{ .content = &bg, .ansi_prefix = "" };
+            cell.* = background;
         }
 
         // Sort layers by z-index
@@ -83,7 +84,7 @@ pub const LayerStack = struct {
 
         // Paint each layer onto the grid
         for (sorted) |layer| {
-            self.paintLayer(grid, w, h, layer);
+            paintLayer(grid, w, h, layer, background);
         }
 
         // Render grid to string
@@ -109,8 +110,7 @@ pub const LayerStack = struct {
         return result.toArrayList().items;
     }
 
-    fn paintLayer(self: *const LayerStack, grid: []Cell, w: usize, h: usize, layer: Layer) void {
-        _ = self;
+    fn paintLayer(grid: []Cell, w: usize, h: usize, layer: Layer, background: Cell) void {
         const content = layer.content;
         var row: usize = layer.y;
         var col: usize = layer.x;
@@ -173,16 +173,25 @@ pub const LayerStack = struct {
 
             const is_transparent = layer.transparent and codepoint == ' ' and current_ansi.len == 0;
             if (!is_transparent and col + char_width <= w) {
-                grid[row * w + col] = .{
+                const first = row * w + col;
+                // Landing on the second half of a wide character below leaves
+                // its first half unable to draw; blank it.
+                if (col > 0 and grid[first].content.len == 0) grid[first - 1] = background;
+                grid[first] = .{
                     .content = char,
                     .ansi_prefix = current_ansi,
                 };
-                last_cell = row * w + col;
+                last_cell = first;
                 last_start = start;
                 last_end = end;
                 // A wide character covers the following cell as well
                 if (char_width == 2) {
-                    grid[row * w + col + 1] = .{ .content = "" };
+                    grid[first + 1] = .{ .content = "" };
+                }
+                // Covering the first half of a wide character below orphans
+                // its second half, which would otherwise draw nothing; blank it.
+                if (col + char_width < w and grid[first + char_width].content.len == 0) {
+                    grid[first + char_width] = background;
                 }
             } else {
                 last_cell = null;

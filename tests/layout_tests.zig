@@ -250,6 +250,36 @@ test "layer.LayerStack - a joiner keeps an emoji sequence contiguous" {
     try testing.expectEqualStrings("\u{1F468}\u{200D}\u{1F469} ", try stack.render(allocator));
 }
 
+test "layer.LayerStack - an overlay on the first half of a wide character blanks the second" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var stack = zz.layout.layer.LayerStack.init(allocator);
+    defer stack.deinit();
+    stack.setSize(3, 1);
+
+    try stack.push(.{ .content = "\u{6F22}A", .z = 0, .transparent = false });
+    try stack.push(.{ .content = "x", .x = 0, .z = 1 });
+
+    try testing.expectEqualStrings("x A", try stack.render(allocator));
+}
+
+test "layer.LayerStack - an overlay on the second half of a wide character blanks the first" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var stack = zz.layout.layer.LayerStack.init(allocator);
+    defer stack.deinit();
+    stack.setSize(3, 1);
+
+    try stack.push(.{ .content = "\u{6F22}A", .z = 0, .transparent = false });
+    try stack.push(.{ .content = "x", .x = 1, .z = 1 });
+
+    try testing.expectEqualStrings(" xA", try stack.render(allocator));
+}
+
 test "layer.LayerStack - reports allocation failure instead of truncating" {
     // The old signature had no way to say an allocation failed, so it returned
     // a short frame — which reaches the screen looking like a rendering bug.
