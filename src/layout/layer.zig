@@ -81,7 +81,7 @@ pub const LayerStack = struct {
         const planes = try allocator.alloc(?Cell, sorted.len * cells);
         @memset(planes, null);
         for (sorted, 0..) |layer, index| {
-            paintLayer(planes[index * cells ..][0..cells], w, h, layer);
+            try paintLayer(allocator, planes[index * cells ..][0..cells], w, h, layer);
         }
 
         // Composite from the top down. A glyph shows only when no visible
@@ -137,17 +137,19 @@ pub const LayerStack = struct {
         return result.toArrayList().items;
     }
 
-    fn paintLayer(plane: []?Cell, w: usize, h: usize, layer: Layer) void {
+    fn paintLayer(allocator: std.mem.Allocator, plane: []?Cell, w: usize, h: usize, layer: Layer) !void {
         const content = layer.content;
         var row: usize = layer.y;
         var col: usize = layer.x;
         var i: usize = 0;
         var current_ansi: []const u8 = "";
-        // The cell this layer painted last on the current row, and where its
-        // bytes start and end in `content`.
+        // The cell this layer painted last on the current row, where its
+        // bytes start and end in `content`, and whether its text is still that
+        // one slice of `content`.
         var last_cell: ?usize = null;
         var last_start: usize = 0;
         var last_end: usize = 0;
+        var last_sliced = true;
 
         while (i < content.len and row < h) {
             if (content[i] == '\n') {
@@ -190,13 +192,18 @@ pub const LayerStack = struct {
             // emoji presentation selectors: those make a terminal draw a
             // cluster narrower or wider than the per-code-point width every
             // layout here measures, which would shift the rest of the row.
+            // A style escape between the two takes no column, so the mark
+            // still joins the cell; its bytes are copied when not adjacent.
             if (char_width == 0) {
                 if (attachesToPrevious(codepoint)) {
                     if (last_cell) |at| {
-                        if (last_end == start) {
+                        if (last_sliced and last_end == start) {
                             plane[at].?.content = content[last_start..end];
-                            last_end = end;
+                        } else {
+                            plane[at].?.content = try std.mem.concat(allocator, u8, &.{ plane[at].?.content, char });
+                            last_sliced = false;
                         }
+                        last_end = end;
                     }
                 }
                 continue;
@@ -212,6 +219,7 @@ pub const LayerStack = struct {
                 last_cell = at;
                 last_start = start;
                 last_end = end;
+                last_sliced = true;
                 // A wide character covers the following cell as well
                 if (char_width == 2) {
                     plane[at + 1] = .{ .content = "" };
