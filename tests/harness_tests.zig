@@ -67,6 +67,36 @@ const Counter = struct {
     }
 };
 
+/// A model that writes history above the live frame on every key.
+const Printer = struct {
+    pub const Msg = union(enum) {
+        key: zz.KeyEvent,
+    };
+
+    pub fn init(_: *Printer, _: *zz.Context) zz.Cmd(Msg) {
+        return .none;
+    }
+
+    pub fn update(_: *Printer, msg: Msg, ctx: *zz.Context) !zz.Cmd(Msg) {
+        switch (msg) {
+            .key => try ctx.printAbove("history line"),
+        }
+        return .none;
+    }
+
+    pub fn view(_: *const Printer, _: *const zz.Context) []const u8 {
+        return "live";
+    }
+};
+
+test "harness deinit frees the text a model printed above" {
+    var h = try zz.testing.Harness(Printer).init(testing.allocator, testing.io, .{});
+    defer h.deinit();
+    try h.start();
+
+    try h.pressChar('p');
+}
+
 fn newHarness() !zz.testing.Harness(Counter) {
     return zz.testing.Harness(Counter).init(testing.allocator, testing.io, .{});
 }

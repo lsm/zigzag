@@ -102,6 +102,7 @@ pub fn Harness(comptime Model: type) type {
                 self.model.deinit();
             }
             self.effects.deinit();
+            self.context.deinit();
             self.arena.deinit();
         }
 
