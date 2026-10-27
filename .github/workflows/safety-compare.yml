@@ -1,0 +1,46 @@
+name: Zig and Rust safety comparison
+
+on:
+  push:
+    branches:
+      - experiment/rust-zig-safety-2026
+    paths:
+      - experiments/rust-zig-safety/**
+      - .github/workflows/safety-compare.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Zig stable 0.17.0
+        uses: mlugg/setup-zig@v2
+        with:
+          version: '0.17.0'
+      - name: Record toolchain versions
+        run: |
+          zig version
+          rustc --version
+          cargo --version
+          python3 --version
+      - name: Unpack source bundle
+        run: |
+          mkdir -p experiments/rust-zig-safety
+          base64 -d experiments/rust-zig-safety/sources.tar.gz.b64 | tar xzf - -C experiments/rust-zig-safety
+      - name: Run safety experiment, positive and negative controls
+        working-directory: experiments/rust-zig-safety
+        run: python3 tools/run_experiment.py --dangerous
+      - name: Upload experiment results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-zig-safety-results
+          path: experiments/rust-zig-safety/results/
+          if-no-files-found: warn
