@@ -1,6 +1,6 @@
 # Rust vs Plain Zig vs Restricted Zig — reproducible safety probe
 
-**Stage:** prototype; no published compiler outcome until the actual CI logs exist.
+**Stage:** iterative, empirical CI validation. Initial CI run on 2026-10-27 hit Zig 0.17 parser errors from the removed `**` array repetition syntax; this revision uses `@splat` and lowercase optimize modes. Do not count the initial parser errors as memory-safety findings.
 **Language targets:** Zig 0.17.0, Rust stable (version recorded by CI).
 
 This is NOT a benchmark proving one language is intrinsically safer or easier for AI; it
@@ -24,7 +24,7 @@ Count trusted code LOC separately; just counting application LOC would flatter t
 
 | Fault | Zig plain | Zig restricted | Rust safe |
 |---|---|---|---|
-| Runtime out-of-bounds indexing | Debug `zig test fixtures/zig_oob.zig` should stop | gate forbids direct indexing in app | runtime bounds panic; not always compile error |
+| Runtime out-of-bounds indexing | debug `zig test fixtures/zig_oob.zig` should stop | gate forbids direct indexing in app | runtime bounds panic; not always compile error |
 | Leaked allocation | `std.testing.allocator` should report leak | gate forbids allocator in app; trusted core must be audited | RAII cleans normal owned Vec case |
 | Use after free | Zig can compile it; runtime outcome of UB NOT reliable | app gate forbids direct free and pointer casts | compile error E0382 |
 | Unsynchronized shared write | Zig can compile; data race is UB | no direct spawn in app; core uses disjoint outputs | sample with simultaneous `&mut` fails borrow check |
@@ -36,8 +36,8 @@ Count trusted code LOC separately; just counting application LOC would flatter t
 * Direct allocator use in restricted application code is denied, but this does
   **not** ensure safe lifetime semantics in the trusted core. The core is a trusted
   computing base requiring audit and separate adversarial tests.
-* Zig release-fast safety checks are intentionally out of scope; use Debug and
-  ReleaseSafe. The `zig test` allocator reports leaks in Zig test mode.
+* Zig release-fast safety checks are intentionally out of scope; use debug and
+  safe. The `zig test` allocator reports leaks in Zig test mode.
 * Fault detection is scored **by stage**, not averaged blindly. Passing a racy
   test or a use-after-free test is NOT proof that an implementation is safe.
 * AI-generated-code error rate requires repeated generated tasks with a fixed
@@ -59,11 +59,12 @@ Outputs: `results/results.json` and `results/results.md`; never interpret
 
 ## GitHub Actions
 
-The workflow `.github/workflows/safety-compare.yml` is designed to be copied
-into the **repository root** (not underneath this folder). Its push trigger is
-restricted to the disposable experimental branch so that the unrelated main
-project is not affected. It uses `mlugg/setup-zig@v2` for Zig 0.17.0 and the
-GitHub-hosted Rust toolchain. Inspect the Actions run log before drawing conclusions.
+The workflow is installed at the repository root (`.github/workflows/safety-compare.yml`).
+Its push trigger is limited to branch `experiment/rust-zig-safety-2026`, so the
+unrelated default branch is untouched. It installs Zig 0.17.0 via
+`mlugg/setup-zig@v2` and uses GitHub-hosted Rust. It uploads machine-readable
+results even after a failed run. Prior initial run: <https://github.com/lsm/zigzag/actions/runs/40512071675>.
+Inspect the latest run log and **artifact** before drawing conclusions.
 
 ## Independent references
 

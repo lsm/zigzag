@@ -1,12 +1,11 @@
-name: Zig and Rust safety comparison
+name: Rust vs Zig safety experiment
 
 on:
   push:
-    branches:
-      - experiment/rust-zig-safety-2026
+    branches: ["experiment/rust-zig-safety-2026"]
     paths:
-      - experiments/rust-zig-safety/**
-      - .github/workflows/safety-compare.yml
+      - "experiments/rust-zig-safety/**"
+      - ".github/workflows/safety-compare.yml"
   workflow_dispatch:
 
 permissions:
@@ -18,26 +17,24 @@ jobs:
     timeout-minutes: 15
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    defaults:
+      run:
+        working-directory: experiments/rust-zig-safety
     steps:
       - uses: actions/checkout@v4
-      - name: Install Zig stable 0.17.0
+      - name: Install Zig 0.17.0
         uses: mlugg/setup-zig@v2
         with:
           version: '0.17.0'
-      - name: Record toolchain versions
+      - name: Record compiler versions
         run: |
           zig version
           rustc --version
           cargo --version
           python3 --version
-      - name: Unpack source bundle
-        run: |
-          mkdir -p experiments/rust-zig-safety
-          base64 -d experiments/rust-zig-safety/sources.tar.gz.b64 | tar xzf - -C experiments/rust-zig-safety
-      - name: Run safety experiment, positive and negative controls
-        working-directory: experiments/rust-zig-safety
+      - name: Run positive cases, intentional failures, and policy tests
         run: python3 tools/run_experiment.py --dangerous
-      - name: Upload experiment results
+      - name: Upload results even if tests fail
         if: always()
         uses: actions/upload-artifact@v4
         with:
